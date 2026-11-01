@@ -1,0 +1,6 @@
+LIBRARY FileRemarksPropHandler
+EXPORTS
+    DllGetClassObject
+    DllCanUnloadNow
+    DllRegisterServer
+    DllUnregisterServer

@@ -1,0 +1,17 @@
+# Build output
+build/
+dist/
+
+# The portable MinGW toolchain lives next to the sources on the author's
+# machine; it is a build dependency, not part of the project.
+tools/mingw64/
+tools/mingw.7z
+
+# Python
+__pycache__/
+*.pyc
+
+# Scratch
+_dbg_*.py
+*.log
+*.tmp
