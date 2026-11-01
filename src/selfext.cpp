@@ -38,9 +38,9 @@
 // "Programs and Features" and compared with the installed copy at launch, so
 // the dialog can say "v1.2 -> v1.3".
 #define FR_VERSION_MAJOR 1
-#define FR_VERSION_MINOR 13
-#define FR_VERSION_TEXT  L"1.13"
-#define FR_VERSION_FULL  L"1.13.0.0"
+#define FR_VERSION_MINOR 14
+#define FR_VERSION_TEXT  L"1.14"
+#define FR_VERSION_FULL  L"1.14.0.0"
 #define FR_BUILD_TAG     L"v" FR_VERSION_TEXT L"  build 2026-11-01"
 
 // ---------------------------------------------------------------------------
@@ -116,6 +116,13 @@ static bool EnsureDir(const std::wstring& path)
 // HKCU\Software\Classes\... simply takes precedence over the machine-wide keys.
 static std::wstring GetProgDir()
 {
+    // Test hook: the automated probes run inside a sandbox that denies writes
+    // outside the project folder, so they point the install root at a
+    // throw-away directory to exercise a real install. Unset in normal use.
+    WCHAR over[MAX_PATH] = { 0 };
+    if (GetEnvironmentVariableW(L"FR_REMARKS_ROOT", over, MAX_PATH) > 0 && over[0])
+        return std::wstring(over);
+
     WCHAR appdata[MAX_PATH] = { 0 };
     if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, appdata)))
         return std::wstring(appdata) + L"\\FileRemarks";
@@ -260,6 +267,102 @@ static bool UnregisterDll(const std::wstring& dllPath)
     return ok;
 }
 
+// --- install layout --------------------------------------------------------
+//
+// The programs live in a per-version sub-directory:
+//
+//     %LOCALAPPDATA%\FileRemarks\app-1.14\FileRemarksPropHandler.dll
+//     ...
+//
+// and the root holds only the uninstaller (FileRemarksSetup.exe). The reason is
+// not tidiness: a property handler is loaded by explorer.exe, and a loaded image
+// cannot be replaced -- measured on this machine, copying over the live DLL and
+// renaming it both fail with ERROR_ACCESS_DENIED (0x5), because the image is
+// mapped without FILE_SHARE_DELETE. Overwriting in place is therefore
+// impossible, and "reinstall" used to fail with "无法替换正在使用的文件".
+//
+// Writing a NEW directory sidesteps that completely: nothing in use is touched,
+// the registration is simply pointed at the new place, and the previous
+// directory is deleted on the next boot (its DLL is still mapped until then).
+static std::wstring MakeFreshAppDir()
+{
+    std::wstring base = GetProgDir() + L"\\app-" FR_VERSION_TEXT;
+    std::wstring cand = base;
+    for (int i = 2; i < 100; ++i)
+    {
+        if (GetFileAttributesW(cand.c_str()) == INVALID_FILE_ATTRIBUTES)
+            return cand;
+        WCHAR suffix[16] = { 0 };
+        wsprintfW(suffix, L"-%d", i);
+        cand = base + suffix;
+    }
+    return base;
+}
+
+// Delete a directory and everything in it, deferring to the next boot whatever
+// cannot go now (the previous version's DLL is still mapped by explorer).
+static void RemoveDirLazy(const std::wstring& dir)
+{
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE)
+    {
+        do
+        {
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0)
+                continue;
+            RemoveFileLazy(dir + L"\\" + fd.cFileName);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    if (!RemoveDirectoryW(dir.c_str()))
+        MoveFileExW(dir.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+}
+
+// Remove every app-* directory except the one just installed. An empty `keep`
+// removes all of them, which is what uninstall wants.
+static void CleanupOldAppDirs(const std::wstring& keep)
+{
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((GetProgDir() + L"\\app-*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do
+    {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        std::wstring dir = GetProgDir() + L"\\" + fd.cFileName;
+        if (!keep.empty() && _wcsicmp(dir.c_str(), keep.c_str()) == 0) continue;
+        RemoveDirLazy(dir);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+// Directories that may hold an installed copy: the root (the flat layout used up
+// to v1.13), every per-version app-* directory, and a machine-wide install left
+// behind by builds up to v1.8.
+static std::vector<std::wstring> CandidateDirs()
+{
+    std::vector<std::wstring> dirs;
+    dirs.push_back(GetProgDir());
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((GetProgDir() + L"\\app-*").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE)
+    {
+        do
+        {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                dirs.push_back(GetProgDir() + L"\\" + fd.cFileName);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    std::wstring legacy = GetLegacyDir();
+    if (!legacy.empty()) dirs.push_back(legacy);
+    return dirs;
+}
+
+// Set by DoInstall so the success message can ask the DLL that was just
+// registered, instead of guessing where it went.
+static std::wstring g_lastAppDir;
+
 // Asks the property handler DLL how many of the six folder types really show the
 // 备注 column right now. Returns -1 when it cannot be asked.
 //
@@ -278,7 +381,7 @@ static int QueryColumnCount(const std::wstring& dllPath)
     return n;
 }
 
-// --- Ctrl+Alt+E helper -----------------------------------------------------
+// --- Shift+F2 helper -------------------------------------------------------
 // FileRemarksHotkey.exe holds the system-wide shortcut and has to be running
 // for it to work. It is registered for auto-start under HKCU\...\Run (no
 // elevation needed) and started immediately after installing, otherwise the
@@ -459,9 +562,16 @@ static std::wstring ExtractPayload(const std::wstring& self, const std::wstring&
 
 static std::wstring DoInstall(const std::vector<std::wstring>& files)
 {
-    std::wstring dst = GetProgDir();
+    const std::wstring root = GetProgDir();
+    if (!EnsureDir(root))
+        return L"无法创建安装目录：" + root + L"\n请确认该目录可写。";
+
+    // A brand-new directory per install, so nothing that Explorer has loaded is
+    // ever overwritten -- see the comment above MakeFreshAppDir.
+    std::wstring dst = MakeFreshAppDir();
     if (!EnsureDir(dst))
         return L"无法创建安装目录：" + dst + L"\n请确认该目录可写。";
+    g_lastAppDir = dst;
     for (const auto& f : files)
     {
         std::wstring name = f.substr(f.find_last_of(L"\\/") + 1);
@@ -476,7 +586,7 @@ static std::wstring DoInstall(const std::vector<std::wstring>& files)
         WCHAR self[MAX_PATH] = { 0 };
         GetModuleFileNameW(nullptr, self, MAX_PATH);
         std::wstring err;
-        if (!InstallFile(self, dst + L"\\FileRemarksSetup.exe", err))
+        if (!InstallFile(self, root + L"\\FileRemarksSetup.exe", err))
             Log(L"installer copy failed: " + err); // not fatal
     }
 
@@ -488,9 +598,9 @@ static std::wstring DoInstall(const std::vector<std::wstring>& files)
         return L"注册右键菜单失败。\n" + rerr + L"\n请检查 " + dst +
                L"\\FileRemarksShellExt.dll 是否被安全软件拦截。";
 
-    WriteUninstallEntry(dst + L"\\FileRemarksSetup.exe");
+    WriteUninstallEntry(root + L"\\FileRemarksSetup.exe");
 
-    // Install or restart the Ctrl+Alt+E helper so the shortcut works straight
+    // Install or restart the Shift+F2 helper so the shortcut works straight
     // away. A failure here is worth a log line but not a failed install: the
     // editor and the 备注 column work without it.
     StopHotkey();
@@ -498,21 +608,33 @@ static std::wstring DoInstall(const std::vector<std::wstring>& files)
         Log(L"auto-start entry failed");
     StartHotkey(dst);
 
+    // The previous version's folder is still mapped by explorer.exe, so its
+    // files are removed on the next boot; the registration already points here.
+    CleanupOldAppDirs(dst);
+
     return L"";
 }
 
 static std::wstring DoUninstall()
 {
-    std::wstring dst = GetProgDir();
+    const std::wstring dst = GetProgDir();
 
     // Stop the shortcut helper before touching the files: a running .exe cannot
     // be deleted, and leaving it alive would keep a hotkey that does nothing.
     StopHotkey();
     RemoveRunEntry();
 
-    UnregisterDll(dst + L"\\FileRemarksPropHandler.dll");
-    UnregisterDll(dst + L"\\FileRemarksShellExt.dll");
+    // Unregister every copy that could be the registered one: the flat layout
+    // used up to v1.13 sits in the root, newer installs sit in app-* folders.
+    for (const auto& dir : CandidateDirs())
+    {
+        UnregisterDll(dir + L"\\FileRemarksPropHandler.dll");
+        UnregisterDll(dir + L"\\FileRemarksShellExt.dll");
+    }
     RemoveUninstallEntry();
+
+    // Whole per-version folders, plus the files of a pre-v1.14 flat install.
+    CleanupOldAppDirs(std::wstring());
 
     // The files are usually still loaded by explorer.exe, so a plain delete
     // fails; RemoveFileLazy defers those to the next reboot.
@@ -583,9 +705,12 @@ static bool IsInstalled()
         }
     }
 
-    if (GetFileAttributesW((GetProgDir() + L"\\FileRemarksPropHandler.dll").c_str())
-        != INVALID_FILE_ATTRIBUTES)
-        return true;
+    for (const auto& dir : CandidateDirs())
+    {
+        if (GetFileAttributesW((dir + L"\\FileRemarksPropHandler.dll").c_str())
+            != INVALID_FILE_ATTRIBUTES)
+            return true;
+    }
 
     std::wstring legacy = GetLegacyDir();
     if (!legacy.empty() &&
@@ -628,8 +753,8 @@ static std::wstring InstalledVersion()
     }
 
     // Fall back to the file version of an installed handler DLL.
-    std::wstring dirs[2] = { GetProgDir(), GetLegacyDir() };
-    for (int i = 0; i < 2; ++i)
+    const std::vector<std::wstring> dirs = CandidateDirs();
+    for (size_t i = 0; i < dirs.size(); ++i)
     {
         if (dirs[i].empty()) continue;
         std::wstring dll = dirs[i] + L"\\FileRemarksPropHandler.dll";
@@ -745,12 +870,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 
                 // Ask the property handler how many folder types really show the
                 // 备注 column now, instead of assuming the registration worked.
-                const int cols = QueryColumnCount(GetProgDir() + L"\\FileRemarksPropHandler.dll");
+                const std::wstring asked = g_lastAppDir.empty() ? GetProgDir() : g_lastAppDir;
+                const int cols = QueryColumnCount(asked + L"\\FileRemarksPropHandler.dll");
                 Log(L"column types enabled=" + std::to_wstring(cols));
 
                 std::wstring msg =
                     L"安装完成！\n\n在任意文件上点右键 -> “编辑备注” 即可使用。\n"
-                    L"也可以先选中一个文件，按 Ctrl+Alt+E 直接打开备注。\n";
+                    L"也可以先选中一个文件，按 Shift+F2 直接打开备注。\n";
                 if (cols >= 6)
                     msg += L"资源管理器里的“备注”列也已经默认打开。\n";
                 else if (cols > 0)

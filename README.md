@@ -41,7 +41,7 @@
 
 ## 安装（不需要管理员权限）
 
-**只有一个文件：`dist/releases/FileRemarks_Setup_v1.13.exe`**
+**只有一个文件：`dist/releases/FileRemarks_Setup_v1.14.exe`**
 
 > `dist/releases/` 里按版本号归档，**每次迭代都保留之前的安装包**，文件名带版本后缀，
 > 所以想回到旧版随时双击对应的那个即可（例如 `FileRemarks_Setup_v1.7.exe`）。
@@ -51,7 +51,7 @@
 
    | 当前已安装版本 | 要安装的版本 |
    | --- | --- |
-   | 例如 `v1.11`，或 `旧版本（未记录版本号）`，没装过则显示 `未安装` | `v1.13（本安装包）` |
+   | 例如 `v1.13`，或 `旧版本（未记录版本号）`，没装过则显示 `未安装` | `v1.14（本安装包）` |
 
    下面两个按钮：**安装 / 重新安装**（蓝底，回车等同）、**卸载**。没有“取消”按钮——
    不想操作就**直接关窗口或按 `Esc`**。
@@ -119,7 +119,7 @@
 > 窗口内快捷键：`Ctrl+A` 全选、`Ctrl+Backspace` 删一个词、`Esc` 或 `Ctrl+Enter` 直接关窗口
 > （都会自动保存）。
 
-5. 也可以在资源管理器里**先选中一个文件，按 `Ctrl+Alt+E`**，直接弹出它的备注窗口。
+5. 也可以在资源管理器里**先选中一个文件，按 `Shift+F2`**，直接弹出它的备注窗口。
    这个组合键由一个常驻小程序 `FileRemarksHotkey.exe` 注册（安装时自动启动，写在
    `HKCU\...\Run\FileRemarksHotkey`，卸载时自动退出并删除）。它只监听这一个组合键，
    不做键盘钩子，所以不会影响 F8 之类的单键；没有选中文件时按下不会做任何事。
@@ -138,7 +138,7 @@
 
 ## 验证情况
 
-十五个测试脚本 + 五个回归探针全部通过，都是**真实调用编出来的二进制**（真实 NTFS 卷、真实 GUI 窗口、真实 COM 对象、真实注册表读取）：
+十六个测试脚本 + 六个回归探针全部通过，都是**真实调用编出来的二进制**（真实 NTFS 卷、真实 GUI 窗口、真实 COM 对象、真实注册表读取）：
 
 | 测试 | 覆盖什么 | 结果 |
 | --- | --- | --- |
@@ -153,15 +153,17 @@
 | `tools/test_placeholder.py` | 空备注框真的显示提示语：空的时候框里有 170 个非白像素（提示语 `在这输入备注...` 画在上面）→ 输入自己的文字后提示语消失、且框里的值只有输入的内容（提示语**不会**被存进去）→ 再清空，提示语又回来（170 像素）；**真按键**（`WM_CHAR`）敲一个字后，除该字符所在的 20px 列以外所有列都必须干净，再用退格删空后提示语必须重新出现（170 像素）——用 `WM_SETTEXT` 测不出“提示语和文字叠在一起”，因为它会重绘整个控件 | **PASS** |
 | `tools/test_no_delay.py` | **没有延迟**：先确认新文件读不到备注 → 用真编辑器写入中文备注并关窗 → 立刻新建一个属性存储读 `System.Comment`，必须已经是最新文字；再读一次仍然一致（不是缓存碰巧）→ 清空后再读必须为空 | **PASS** |
 | `tools/test_columns_autoenable.py` | **“备注”列自动打开**：先核字面量 `;0System.Comment`、追加只加一次且不动原有顺序、对已含该列的列定义是幂等的、结尾分号会被清掉；再问真实注册表“现在到底有几种文件夹类型显示着备注”（`FrTestCountEnabled`），跑一遍启用路径后再问一次，要求只增不减，并且“报告改了 0 个”真的对应数量没变（不允许出现“函数说改了、注册表没动静”）。本机沙箱里注册表写被拒，所以这里表现出来是 `2 / 6` 且 `0 changed` —— 这恰好证明它读的是真实状态，而不是照抄一句“成功” | **PASS** |
-| `tools/test_installer_ui.py` | 安装窗口：已装版本/目标版本两者都对且互不相同（`旧版本（未记录版本号）` vs `v1.13（本安装包）`）；真窗口标题 `FileRemarks`、客户区宽 520 且高度随内容自适应、**只有两个按钮**（重新安装/安装 + 卸载，无“取消”）、两个按钮都完整落在客户区内（不裁切）、焦点在主按钮上、页面像素 `(243,243,243)`、卡片白、主按钮填充是纯蓝 `(0,95,184)`（证明按钮文字没有白底块）；关窗/`Esc` 返回 0、未安装时 `卸载` 点击无效、`Enter` 返回 1 | **PASS** |
+| `tools/test_installer_ui.py` | 安装窗口：已装版本/目标版本两者都对且互不相同（`旧版本（未记录版本号）` vs `v1.14（本安装包）`）；真窗口标题 `FileRemarks`、客户区宽 520 且高度随内容自适应、**只有两个按钮**（重新安装/安装 + 卸载，无“取消”）、两个按钮都完整落在客户区内（不裁切）、焦点在主按钮上、页面像素 `(243,243,243)`、卡片白、主按钮填充是纯蓝 `(0,95,184)`（证明按钮文字没有白底块）；关窗/`Esc` 返回 0、未安装时 `卸载` 点击无效、`Enter` 返回 1 | **PASS** |
 | `tools/test_registry_plan.py` | 注册计划不变量：从源码解析出三张扩展名表，对着真实注册表重放注册决策，断言三张表互不重叠、无重复、候选类型从不指向我们、Office 永不落到我们头上、卸载能撤销注册写下的每一处 | **PASS** |
 | `tools/test_wildcard_safety.py` | 通配注册的安全性：枚举本机 **247** 个有原生处理器的类型，逐个分类为「我们包一层(33)」/「钉回原生 CLSID(22)」/「安装时枚举后钉住(192)」，确认没有任何类型会因为 `*` 通配而丢掉原生列 | **PASS** |
 | `tools/probe_stale_text.py` | **删掉的字必须真的从屏幕上消失**：9 种删法（退格删掉一整行、全选后删除、先滚动到底再全选删除、从中间删掉一行、选中尾部退格、全选后打一个字覆盖、长文缩成一行、词中间删掉一个字母、滚动后连着退格）三重判据都要过：① 控件里的值必须是剩下的文字；② 画面墨点数要和“新建窗口、只填最终文字”的干净画面一致；③ **强制整块重绘后墨点数不许减少**（少了就说明那些墨点是残留——控件早就忘了，屏幕还留着）。v1.10 之前“从中间删掉一行”残留 `468` 个墨点 vs 干净画面 `108`，整块重绘后掉到 `112`，即 `356` 个像素是假的；现在 9 种全部通过 | **PASS** |
 | `tools/probe_button_flicker.py` | **安装窗口按钮不再闪**：载入真实的 `build/selftest_installer_ui.dll` 起出真窗口，确认父窗口带 `WS_CLIPCHILDREN`；连发 60 条 `WM_MOUSEMOVE` 后父窗口的 `GetUpdateRect` 必须一直为空（修复前每次移动都会让父窗口重绘、把页面底色刷到按钮上）；扫过按钮采样 240 个像素点，丢失 `0` 个；40 次完全相同的移动只触发 `80` 次按钮重绘（进入/离开各一次，且不再随消息数增长） | **PASS** |
-| `tools/test_hotkey.py` | **常驻快捷键进程**：两个产物都在；`PackedCombo()` 必须等于 `0x00030045`（`Ctrl+Alt` + `E`）；进程起来后窗口类 `FileRemarksHotkeyWnd` 存在（证明组合键真的注册上了）；`%TEMP%\FileRemarks_hotkey.log` 里出现 `helper started`；向运行中的进程发 `WM_QUERY_COMBO` 也回同一个值；第二次启动立即退出且不影响第一个实例；`FrTestLaunchIn` 能起出 `FileRemarksEditorWnd` 窗口；选中的解析在拿不到 shell 视图时返回空串（不瞎猜）；`WM_CLOSE` 后窗口消失、进程退出码 0 | **PASS** |
+| `tools/test_hotkey.py` | **常驻快捷键进程**：两个产物都在；`PackedCombo()` 必须等于 `0x00040071`（`Shift` + `F2`）；进程起来后窗口类 `FileRemarksHotkeyWnd` 存在（证明组合键真的注册上了）；`%TEMP%\FileRemarks_hotkey.log` 里出现 `helper started`；向运行中的进程发 `WM_QUERY_COMBO` 也回同一个值；第二次启动立即退出且不影响第一个实例；`FrTestLaunchIn` 能起出 `FileRemarksEditorWnd` 窗口；选中的解析在拿不到 shell 视图时返回空串（不瞎猜）；`WM_CLOSE` 后窗口消失、进程退出码 0 | **PASS** |
+| `tools/test_install_layout.py` | **覆盖安装不能碰正在使用的文件**：用 `FR_REMARKS_ROOT` 把安装根指到临时目录（沙箱禁止写 `%LOCALAPPDATA%`），调真 `MakeFreshAppDir()`/`CleanupOldAppDirs()`：第一次装到 `app-1.14`，**第二次必须换到 `app-1.14-2`**、第三次 `app-1.14-3`，且上一次装进去的文件 mtime/大小一个字节都不变；清理只删旧目录、留下刚装的那个；卸载布局把 `app-*` 全删 | **PASS** |
+| `tools/probe_reinstall.py` | **真点“重新安装”**：起真安装包、按真按钮、比对装完的 4 个组件与 `dist/` 的 sha256、打印安装器日志尾部、列 `.old` 残留。本沙箱拒写 `%LOCALAPPDATA%` 会打印 SKIP 并退出 3，要在正常桌面会话里跑才有意义 | **SKIP（沙箱）** |
 | `tools/probe_stream_init.py` | **属性处理器能不能“只给流”地初始化**：不走注册表，直接把 DLL 载入，`DllGetClassObject` → 要 `IInitializeWithStream` → 建一个指向测试文件的流 → `Initialize(stream)` → `QI IPropertyStore` → `GetCount` 必须 ≥ 1。同一个脚本指向 v1.12 的 DLL 会红在“没有这个接口”（正是“备注列一直是空”的根因），指向 v1.13 全过 | **PASS** |
 | `tools/probe_select_all.py` | **能全选、能一次删光**：起真编辑器、填三行中文，然后按 Ctrl+A —— 修复前 `EM_GETSEL` 拿到的是 `0..0`（一个普通 `EDIT` 控件从来没实现过 Ctrl+A，记事本的“全选”来自它自己的加速键表），所以既选不中也删不掉；现在断言全选范围是 `0..19`、按 Delete 后控件值为空、Ctrl+Backspace 删掉光标前一个词、全选后直接打字会整体替换。同一个脚本指向 Program Files 里那个已安装的旧编辑器时会 4 条全红，正好把“旧版本没这个功能”和“新版本坏了”区分开 | **PASS** |
-| `build/selftest_extract.dll` + `FrSelfTest` | 从最终的 `dist/releases/FileRemarks_Setup_v1.13.exe` 真解压出 **4** 个文件，与 `dist/` 逐个 **sha256 完全一致** | **PASS** |
+| `build/selftest_extract.dll` + `FrSelfTest` | 从最终的 `dist/releases/FileRemarks_Setup_v1.14.exe` 真解压出 **4** 个文件，与 `dist/` 逐个 **sha256 完全一致** | **PASS** |
 
 另外单独验证了旧版 Office 格式的 `System.Comment` 写入：真实 `.doc` / `.xls` / `.ppt` 都能写入、读回、清空；
 `.rtf` 被拒绝（和 `.mp3` 一样属于“少数类型只写 ADS”的情况）。
@@ -256,8 +258,10 @@ python tools/probe_select_all.py           # Ctrl+A 能不能全选、能不能�
 ```bash
 python tools/probe_no_elevation.py         # 安装器进程未提权 + 窗口出自该进程 + 无 SmartScreen
 python tools/probe_stream_init.py          # 属性处理器能不能被“只给一个流”地初始化
-python tools/probe_hotkey_selection.py     # Ctrl+Alt+E 取选中文件那一步（本沙箱里必然 SKIP）
+python tools/probe_hotkey_selection.py     # Shift+F2 取选中文件那一步（本沙箱里必然 SKIP）
 python tools/test_hotkey.py                # 常驻进程：组合键注册、单实例、关窗退出
+python tools/test_install_layout.py        # 覆盖安装为什么不再需要重启（版本目录）
+python tools/probe_reinstall.py            # 真点一次“重新安装”，比对落盘结果
 python tools/probe_elev_series.py          # 对照实验：会提权的一组 vs 不会提权的一组，各跑 7 次
 ```
 
@@ -337,7 +341,7 @@ FileRemarks/
 │   ├── build_msvc.bat              # MSVC 构建脚本
 │   ├── check_logo.py               # 图标形状断言
 │   ├── preview_logo.py             # 把图标画成 PNG 便于肉眼对比
-│   ├── test_*.py                   # 上面那十五个验证脚本 + 五个回归探针
+│   ├── test_*.py                   # 上面那十六个验证脚本 + 六个回归探针
 │   ├── fake_dataobject.py          # 仅测试用：手搓 IDataObject(CF_HDROP)
 │   ├── test_no_delay.py            # 保存后“备注”列立刻可见
 │   └── mingw64/                    # 便携 MinGW 工具链（仅本地构建用，不入库）
@@ -349,7 +353,8 @@ FileRemarks/
 │       ├── FileRemarks_Setup_v1.10.exe
 │       ├── FileRemarks_Setup_v1.11.exe
 │       ├── FileRemarks_Setup_v1.12.exe
-│       └── FileRemarks_Setup_v1.13.exe
+│       ├── FileRemarks_Setup_v1.13.exe
+│       └── FileRemarks_Setup_v1.14.exe
 └── build/                          # 编译中间产物
 ```
 
@@ -357,9 +362,29 @@ FileRemarks/
 
 ## 更新记录
 
+**v1.14**
+
+- **快捷键从 `Ctrl+Alt+E` 改成 `Shift+F2`**（用户要求）。注册的仍然是一个普通组合键，
+  没有键盘钩子：`RegisterHotKey(MOD_SHIFT | MOD_NOREPEAT, VK_F2)`，常量集中在
+  `src/hotkey.h`，`PackedCombo()` 由 `0x00030045` 变成 `0x00040071`，
+  `tools/test_hotkey.py` 直接断言这个数，并从运行中的进程再问一次。
+- **修好“覆盖安装”**：以前直接重装会弹出
+  `无法替换正在使用的文件：...\FileRemarksPropHandler.dll  错误码 0x00000005`，
+  只能先卸载再装。根因是**属性处理器 DLL 被 explorer.exe 加载着**，正在使用的映像既不能覆盖、
+  也不能改名（rename-to-`.old` 那套补救对加载中的 DLL 无效）。
+  现在改成**按版本目录安装**：程序进 `%LOCALAPPDATA%\FileRemarks\app-1.14\`，
+  同版本重复安装继续退让成 `app-1.14-2`、`app-1.14-3`…，注册项指向新目录，
+  旧目录在下次启动时删掉。于是安装过程**永远不碰正在使用的文件**，
+  覆盖安装不再需要重启，也不再需要先卸载。根目录只留卸载器 `FileRemarksSetup.exe`。
+- 新增 `tools/test_install_layout.py`：把真 `MakeFreshAppDir()`/`CleanupOldAppDirs()`
+  指到临时目录，证明“第二次安装一定换目录、旧目录里的文件一个字节都不动、清理只删旧的”。
+  新增 `tools/probe_reinstall.py`：真点一次“重新安装”，比对 4 个组件与 `dist/` 的 sha256。
+- 新增测试钩子 `FR_REMARKS_ROOT`：把安装根指到别处，让上面的测试能在沙箱里跑；
+  正常使用不设这个变量。
+
 **v1.13**
 
-- **新增 `Ctrl+Alt+E` 快捷键**：在资源管理器里选中一个文件，按 `Ctrl+Alt+E` 直接弹出备注窗口。
+- **新增 `Ctrl+Alt+E` 快捷键**（v1.14 起改为 `Shift+F2`）：在资源管理器里选中一个文件，按 `Ctrl+Alt+E` 直接弹出备注窗口。
   资源管理器没有“给右键菜单加自定义快捷键”的接口，所以由一个常驻小进程
   `FileRemarksHotkey.exe` 用 `RegisterHotKey` 注册这一个组合键（不是键盘钩子，不抢单键），
   收到 `WM_HOTKEY` 后经 `IShellWindows → IServiceProvider/SID_STopLevelBrowser →

@@ -1,4 +1,4 @@
-// FileRemarksHotkey.exe -- background helper for the Ctrl+Alt+E shortcut.
+// FileRemarksHotkey.exe -- background helper for the Shift+F2 shortcut.
 //
 // Starts with Windows (the installer writes HKCU\...\Run), holds the hotkey and
 // does nothing else. It shows no window and no tray icon: the product's whole
@@ -87,9 +87,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 
     if (!HotkeyAvailable())
     {
-        fr::hotkey::TraceLog(L"helper exiting: Ctrl+Alt+E is taken by another program");
+        fr::hotkey::TraceLog(L"helper exiting: Shift+F2 is taken by another program");
         CoUninitialize();
-        return 0; // another program owns Ctrl+Alt+E -- nothing to do
+        return 0; // another program owns Shift+F2 -- nothing to do
     }
 
     WNDCLASSEXW wc = { sizeof(wc) };
@@ -121,7 +121,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
         return 0;
     }
 
-    fr::hotkey::TraceLog(L"helper started, shortcut=Ctrl+Alt+E");
+    fr::hotkey::TraceLog(L"helper started, shortcut=Shift+F2");
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0)

@@ -124,7 +124,7 @@ def main():
     print("button-flicker probe")
     print("=" * 66)
 
-    ui.FrTestStartChoice(0, "未安装", "v1.13（本安装包）")
+    ui.FrTestStartChoice(0, "未安装", "v1.14（本安装包）")
     if not ui.FrTestWaitReady():
         print("  the choice window never appeared")
         return 1

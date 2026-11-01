@@ -211,7 +211,7 @@ if installed:
           cur)
 else:
     check(True, "not installed here, so there is no current version to show")
-check(new.startswith("v1.13"), "target version is the 1.13 build", new)
+check(new.startswith("v1.14"), "target version is the 1.14 build", new)
 
 
 # --------------------------------------------------------------------------

@@ -4,6 +4,63 @@
 // Not part of the shipped product.
 #include "selfext.cpp"
 
+// --- install-layout helpers ------------------------------------------------
+// These wrap the per-version directory logic so the probes can prove, without
+// writing to %LOCALAPPDATA%, that a second install NEVER reuses (and therefore
+// never has to overwrite) the directory of a copy that is already loaded.
+
+extern "C" __declspec(dllexport)
+int FrTestRoot(wchar_t* buf, int cap)
+{
+    std::wstring r = GetProgDir();
+    int n = (int)r.size();
+    if (n > cap - 1) n = cap - 1;
+    for (int i = 0; i < n; ++i) buf[i] = r[i];
+    buf[n] = 0;
+    return n;
+}
+
+// Fresh (not yet existing) directory for a new install.
+extern "C" __declspec(dllexport)
+int FrTestFreshAppDir(wchar_t* buf, int cap)
+{
+    std::wstring r = MakeFreshAppDir();
+    int n = (int)r.size();
+    if (n > cap - 1) n = cap - 1;
+    for (int i = 0; i < n; ++i) buf[i] = r[i];
+    buf[n] = 0;
+    return n;
+}
+
+// Create the directory MakeFreshAppDir() suggests; 1 on success.
+extern "C" __declspec(dllexport)
+int FrTestEnsureAppDir(wchar_t* buf, int cap)
+{
+    std::wstring root = GetProgDir();
+    if (!EnsureDir(root)) return 0;
+    std::wstring r = MakeFreshAppDir();
+    if (!EnsureDir(r)) return 0;
+    int n = (int)r.size();
+    if (n > cap - 1) n = cap - 1;
+    for (int i = 0; i < n; ++i) buf[i] = r[i];
+    buf[n] = 0;
+    return 1;
+}
+
+// Remove every app-* directory except `keep` ("" removes all).
+extern "C" __declspec(dllexport)
+void FrTestCleanupAppDirs(const wchar_t* keep)
+{
+    CleanupOldAppDirs(keep ? std::wstring(keep) : std::wstring());
+}
+
+// Number of directories CandidateDirs() reports (root + app-* + legacy).
+extern "C" __declspec(dllexport)
+int FrTestCandidateDirs()
+{
+    return (int)CandidateDirs().size();
+}
+
 // Returns 1 on success, 0 on failure; on failure writes the message to errBuf.
 extern "C" __declspec(dllexport)
 int FrTestInstall(const wchar_t* src, const wchar_t* dst, wchar_t* errBuf, int errCap)

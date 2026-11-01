@@ -1,4 +1,4 @@
-// Ctrl+Alt+E: open the remark editor for the file selected in Explorer.
+// Shift+F2: open the remark editor for the file selected in Explorer.
 //
 // Windows gives Explorer no way to add a shortcut of our own, so the only
 // supported mechanism is a background program holding a system-wide hotkey
@@ -7,7 +7,8 @@
 // test (selftest_hotkey.cpp) run the exact same code -- a test that re-implements
 // the lookup would prove nothing about what ships.
 //
-// Why Ctrl+Alt+E and not a bare F8: RegisterHotKey takes the combination away
+// Why Shift+F2: it is a single function key with one modifier, which almost
+// nothing in common use claims. RegisterHotKey takes the combination away
 // from EVERY program on the machine, so a bare F8 would break F8 in browsers,
 // Office and IDEs. A modified combination is the accepted way to claim a global
 // shortcut. (The alternative, a keyboard hook that only reacts when Explorer is
@@ -33,8 +34,8 @@ namespace hotkey {
 
 // The single shortcut this product owns, as named constants so the test can
 // assert the real values instead of hard-coding its own copies.
-inline const UINT kModifiers = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT;
-inline const UINT kVirtualKey = 'E';
+inline const UINT kModifiers = MOD_SHIFT | MOD_NOREPEAT;
+inline const UINT kVirtualKey = VK_F2;
 inline const int  kHotkeyId = 1;
 inline const WCHAR* kWindowClass = L"FileRemarksHotkeyWnd";
 inline const WCHAR* kWindowTitle = L"FileRemarks 快捷键";

@@ -1,16 +1,16 @@
-"""Verify the Ctrl+Alt+E shortcut helper (FileRemarksHotkey.exe).
+"""Verify the Shift+F2 shortcut helper (FileRemarksHotkey.exe).
 
 What can be proven from this session, and what cannot:
 
   * PROVEN here -- the helper is a single-instance background process that
-    really holds the shortcut Ctrl+Alt+E, that it exposes the combination it
+    really holds the shortcut Shift+F2, that it exposes the combination it
     registered, that a second launch exits instead of registering a duplicate,
     that WM_CLOSE stops it (which is what the uninstaller needs before it can
     delete the .exe), and that the same launch code opens the editor for a file.
   * NOT provable here -- the actual key press. A global hotkey is delivered by
     the window manager to whatever window has focus, and this session cannot
     own the foreground (`SetForegroundWindow`/`SetFocus` return 0 and
-    `keybd_event` is ignored), so pressing Ctrl+Alt+E cannot be simulated.
+    `keybd_event` is ignored), so pressing Shift+F2 cannot be simulated.
     What the shortcut then does -- ask the shell for the selected item and open
     the editor -- is exercised directly through the shipped functions.
 
@@ -38,7 +38,7 @@ WM_APP = 0x8000
 WM_QUERY_COMBO = WM_APP + 7
 WM_CLOSE = 0x0010
 MOD_ALT = 0x0001
-MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
 
 fails = []
 
@@ -80,6 +80,27 @@ def wait_gone(class_name, timeout=6.0):
     return False
 
 
+def kill_stale_helpers():
+    """Terminate any helper left over from an earlier run or install.
+
+    Needed because the window class is global: a stale instance from a previous
+    version would answer FindWindow first and the checks below would describe
+    the OLD process (its combination, its WM_CLOSE behaviour) instead of the
+    binary under test.
+    """
+    for _ in range(60):
+        hwnd = user32.FindWindowW("FileRemarksHotkeyWnd", None)
+        if not hwnd:
+            return True
+        pid = pid_of_window(hwnd)
+        handle = kernel32.OpenProcess(0x0001, False, pid)  # PROCESS_TERMINATE
+        if handle:
+            kernel32.TerminateProcess(handle, 0)
+            kernel32.CloseHandle(handle)
+        time.sleep(0.1)
+    return False
+
+
 def pid_of_window(hwnd):
     pid = w.DWORD(0)
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
@@ -92,6 +113,8 @@ def main():
         if not check(os.path.isfile(path), name + " exists"):
             return 1
 
+    check(kill_stale_helpers(), "no helper from an earlier run is still resident")
+
     os.makedirs(WORK, exist_ok=True)
     with open(TARGET, "w", encoding="utf-8") as handle:
         handle.write("x")
@@ -100,8 +123,8 @@ def main():
     dll = ctypes.WinDLL(DLL)
     dll.FrTestPackedCombo.restype = ctypes.c_uint
     combo = dll.FrTestPackedCombo()
-    expected = ((MOD_CONTROL | MOD_ALT) << 16) | ord("E")
-    check(combo == expected, "shortcut is Ctrl+Alt+E",
+    expected = (MOD_SHIFT << 16) | 0x71  # VK_F2
+    check(combo == expected, "shortcut is Shift+F2",
           "0x%08X vs 0x%08X" % (combo, expected))
 
     # --- the running helper -------------------------------------------------
@@ -134,7 +157,7 @@ def main():
     # The process reports the combination it actually registered; this is what
     # ties the running binary to the constants above.
     asked = user32.SendMessageW(hwnd, WM_QUERY_COMBO, 0, 0) & 0xFFFFFFFF
-    check(asked == expected, "running helper holds Ctrl+Alt+E", "0x%08X" % asked)
+    check(asked == expected, "running helper holds Shift+F2", "0x%08X" % asked)
 
     # --- single instance ----------------------------------------------------
     second = launch(HOTKEY)

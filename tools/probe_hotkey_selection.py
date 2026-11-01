@@ -93,7 +93,7 @@ def main():
         print("     (0x80070005 E_ACCESSDENIED / 0x80040154 REGDB_E_CLASSNOTREG),")
         print("     so the lookup cannot be exercised here.")
         print("     The step itself is standard shell COM and is confirmed on a real")
-        print("     desktop by: select a file, press Ctrl+Alt+E, the editor opens.")
+        print("     desktop by: select a file, press Shift+F2, the editor opens.")
         print("     A line is appended to %TEMP%\\FileRemarks_hotkey.log each time.")
         print()
         print("SELECTION STEP: SKIPPED (sandbox denies shell COM activation)")
