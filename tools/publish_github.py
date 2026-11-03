@@ -29,6 +29,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import ssl
 import subprocess
 import sys
@@ -246,19 +247,37 @@ def ensure_release(gh, owner, name, tag, title, body, setup_path):
     return rel
 
 
+def default_version(repo_dir):
+    """Tag/title default to the version in src/version.h, so a release can
+    never be labeled with a stale hard-coded number again."""
+    try:
+        with open(os.path.join(repo_dir, "src", "version.h"),
+                  encoding="utf-8") as fh:
+            m = re.search(r'#define\s+FR_VERSION_TEXT\s+L"([^"]+)"', fh.read())
+            if m:
+                return m.group(1)
+    except OSError:
+        pass
+    return "0.0"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo-dir", default="github_repo",
                     help="local git checkout whose tracked files get published")
+    args0, _ = ap.parse_known_args()
+    ver = default_version(os.path.abspath(args0.repo_dir))
+
     ap.add_argument("--name", default="FileRemarks")
     ap.add_argument("--private", action="store_true")
-    ap.add_argument("--tag", default="v1.13")
-    ap.add_argument("--setup", default="dist/releases/FileRemarks_Setup_v1.13.exe")
-    ap.add_argument("--title", default="FileRemarks v1.13")
+    ap.add_argument("--tag", default="v" + ver)
+    ap.add_argument("--setup",
+                    default="dist/releases/FileRemarks_Setup_v%s.exe" % ver)
+    ap.add_argument("--title", default="FileRemarks v" + ver)
     ap.add_argument("--description",
                     default="给任意文件加 Windows 资源管理器“备注”列的轻量工具"
                             "（属性处理器 + 右键菜单 + Shift+F2，免管理员安装）")
-    ap.add_argument("--message", default="FileRemarks v1.13 sources")
+    ap.add_argument("--message", default="FileRemarks v%s sources" % ver)
     ap.add_argument("--body-file", default="")
     ap.add_argument("--file-list", default="",
                     help="optional file with one tracked path per line")
@@ -280,7 +299,7 @@ def main():
         print("%s is not a git checkout" % repo_dir, file=sys.stderr)
         return 2
 
-    body = "本次发布包含 v1.13 的全部源码与安装包。"
+    body = "本次发布包含 v%s 的全部源码与安装包。" % ver
     if args.body_file and os.path.exists(args.body_file):
         with open(args.body_file, encoding="utf-8") as fh:
             body = fh.read()
