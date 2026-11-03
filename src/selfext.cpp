@@ -37,11 +37,11 @@
 // Bump these whenever a release is made: the number is written to
 // "Programs and Features" and compared with the installed copy at launch, so
 // the dialog can say "v1.2 -> v1.3".
-#define FR_VERSION_MAJOR 1
-#define FR_VERSION_MINOR 14
-#define FR_VERSION_TEXT  L"1.14"
-#define FR_VERSION_FULL  L"1.14.0.0"
-#define FR_BUILD_TAG     L"v" FR_VERSION_TEXT L"  build 2026-11-01"
+#include "version.h"
+// The text of the final result box lives in its own header so the test suite
+// can assert exactly what the user will read (v1.18: every action must report
+// a result, including a cancelled choice and a silent /uninstall).
+#include "result_msg.h"
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -104,16 +104,14 @@ static bool EnsureDir(const std::wstring& path)
     return GetLastError() == ERROR_ALREADY_EXISTS;
 }
 
-// Per-user install location.
+// Machine-wide install location.
 //
-// Installing under the current user's own profile is what keeps the whole
-// program free of elevation: no administrator token is needed to create the
-// folder, copy the files, or write the registration under HKCU. That matters
-// beyond convenience -- an installer that never asks for elevation is never
-// subjected to the SmartScreen "发行者未知" prompt, which Windows raises for an
-// unsigned executable the moment it requests an elevated token. Per-user COM and
-// shell registration is fully supported: HKCR is a merged view, so
-// HKCU\Software\Classes\... simply takes precedence over the machine-wide keys.
+// The 备注 column needs an HKLM registration. When Windows already ships a
+// property handler for a type -- jpg, png, mp3, exe, ... -- an HKCU association
+// naming another CLSID is simply ignored, and for .exe the built-in handler then
+// fails with 0x80070715 and the column stays empty. Only an HKLM entry takes
+// that slot, so the program lives next to the other machine-wide shell
+// extensions and the installer asks for an administrator token once.
 static std::wstring GetProgDir()
 {
     // Test hook: the automated probes run inside a sandbox that denies writes
@@ -123,20 +121,20 @@ static std::wstring GetProgDir()
     if (GetEnvironmentVariableW(L"FR_REMARKS_ROOT", over, MAX_PATH) > 0 && over[0])
         return std::wstring(over);
 
-    WCHAR appdata[MAX_PATH] = { 0 };
-    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, appdata)))
-        return std::wstring(appdata) + L"\\FileRemarks";
-    return std::wstring(L"C:\\ProgramData\\FileRemarks");
-}
-
-// Where builds up to v1.8 installed the product (machine-wide, needs admin).
-// Only used to report "an older version is still registered" and to show its
-// version number in the dialog.
-static std::wstring GetLegacyDir()
-{
     WCHAR pf[MAX_PATH] = { 0 };
     if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_PROGRAM_FILES, nullptr, 0, pf)))
         return std::wstring(pf) + L"\\FileRemarks";
+    return std::wstring(L"C:\\Program Files\\FileRemarks");
+}
+
+// Where v1.9 - v1.15 installed the product: inside the current user's profile,
+// with a per-user registration. Kept so an upgrade can find that install, tear
+// it down and leave exactly one registration behind.
+static std::wstring GetLegacyDir()
+{
+    WCHAR appdata[MAX_PATH] = { 0 };
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, appdata)))
+        return std::wstring(appdata) + L"\\FileRemarks";
     return std::wstring();
 }
 
@@ -446,7 +444,10 @@ static void StartHotkey(const std::wstring& dir)
     }
 }
 
-static void WriteUninstallEntry(const std::wstring& setupExe)
+// Writes the "应用和功能" entry for the current user. Returns false when any
+// value could not be written, so the v1.18 result box can say the install is
+// only partial instead of silently claiming a clean success.
+static bool WriteUninstallEntry(const std::wstring& setupExe)
 {
     // Per-user entry: appears in "应用和功能" for this user, and uninstall needs
     // no elevation because everything it removes is inside the user's profile.
@@ -454,10 +455,19 @@ static void WriteUninstallEntry(const std::wstring& setupExe)
     LONG r = RegCreateKeyExW(HKEY_CURRENT_USER,
         L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\FileRemarks",
         0, nullptr, REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hk, nullptr);
-    if (r != ERROR_SUCCESS) { Log(L"RegCreateKeyEx(Uninstall) failed " + std::to_wstring(r)); return; }
+    if (r != ERROR_SUCCESS)
+    {
+        Log(L"RegCreateKeyEx(Uninstall) failed " + std::to_wstring(r));
+        return false;
+    }
+    bool ok = true;
     auto setSz = [&](LPCWSTR name, const std::wstring& v) {
-        RegSetValueExW(hk, name, 0, REG_SZ, (const BYTE*)v.c_str(),
-            (DWORD)((v.size() + 1) * sizeof(WCHAR)));
+        if (RegSetValueExW(hk, name, 0, REG_SZ, (const BYTE*)v.c_str(),
+                (DWORD)((v.size() + 1) * sizeof(WCHAR))) != ERROR_SUCCESS)
+        {
+            Log(L"RegSetValueEx(Uninstall) failed: " + std::wstring(name));
+            ok = false;
+        }
     };
     std::wstring us = L"\"" + setupExe + L"\" /uninstall";
     setSz(L"DisplayName", L"FileRemarks");
@@ -467,17 +477,29 @@ static void WriteUninstallEntry(const std::wstring& setupExe)
     setSz(L"InstallLocation", GetProgDir());
     setSz(L"UninstallString", us);
     DWORD one = 1;
-    RegSetValueExW(hk, L"NoModify", 0, REG_DWORD, (const BYTE*)&one, sizeof(one));
-    RegSetValueExW(hk, L"NoRepair", 0, REG_DWORD, (const BYTE*)&one, sizeof(one));
+    if (RegSetValueExW(hk, L"NoModify", 0, REG_DWORD, (const BYTE*)&one,
+                       sizeof(one)) != ERROR_SUCCESS)
+        ok = false;
+    if (RegSetValueExW(hk, L"NoRepair", 0, REG_DWORD, (const BYTE*)&one,
+                       sizeof(one)) != ERROR_SUCCESS)
+        ok = false;
     DWORD v = ((DWORD)FR_VERSION_MAJOR << 16) | (DWORD)FR_VERSION_MINOR;
-    RegSetValueExW(hk, L"VersionMajor", 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
+    if (RegSetValueExW(hk, L"VersionMajor", 0, REG_DWORD, (const BYTE*)&v,
+                       sizeof(v)) != ERROR_SUCCESS)
+        ok = false;
     RegCloseKey(hk);
+    return ok;
 }
 
-static void RemoveUninstallEntry()
+// False only when the key exists and could not be deleted; "already absent"
+// counts as success for an uninstall.
+static bool RemoveUninstallEntry()
 {
-    RegDeleteTreeW(HKEY_CURRENT_USER,
+    const LONG r = RegDeleteTreeW(HKEY_CURRENT_USER,
         L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\FileRemarks");
+    if (r == ERROR_SUCCESS || r == ERROR_FILE_NOT_FOUND) return true;
+    Log(L"RegDeleteTree(Uninstall) failed " + std::to_wstring(r));
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -560,8 +582,57 @@ static std::wstring ExtractPayload(const std::wstring& self, const std::wstring&
 // Install / uninstall
 // ---------------------------------------------------------------------------
 
-static std::wstring DoInstall(const std::vector<std::wstring>& files)
+// Removes what a per-user build (v1.9 - v1.15) left behind: its HKCU
+// registration, the HKCU uninstall entry and the program copies. Two
+// registrations naming different DLLs is exactly the state that blanked the
+// 备注 column, so an upgrade must never leave the old one in place.
+static void CleanupLegacyUserInstall()
 {
+    const std::wstring legacy = GetLegacyDir();
+    if (legacy.empty() || legacy == GetProgDir()) return;
+    if (GetFileAttributesW(legacy.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+
+    Log(L"legacy per-user install found: " + legacy);
+
+    std::vector<std::wstring> dirs;
+    dirs.push_back(legacy);
+    WIN32_FIND_DATAW fd = { 0 };
+    HANDLE h = FindFirstFileW((legacy + L"\\app-*").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE)
+    {
+        do { dirs.push_back(legacy + L"\\" + fd.cFileName); } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+
+    // Unregistering through the old DLL is what removes the HKCU associations,
+    // the CLSID keys and the column bookkeeping: it knows every key it wrote.
+    for (const auto& d : dirs)
+    {
+        UnregisterDll(d + L"\\FileRemarksPropHandler.dll");
+        UnregisterDll(d + L"\\FileRemarksShellExt.dll");
+    }
+    RegDeleteTreeW(HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\FileRemarks");
+
+    for (const auto& d : dirs)
+        RemoveDirLazy(d);
+    if (!RemoveDirectoryW(legacy.c_str()))
+        MoveFileExW(legacy.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+    Log(L"legacy per-user install removed");
+}
+
+// `warnings` collects everything that did not work but does not stop the
+// install. They are reported in the final result box (v1.18) instead of being
+// written only to the log, so "installed, but the column/hotkey did not
+// register" cannot look like a clean success.
+static std::wstring DoInstall(const std::vector<std::wstring>& files,
+                              std::vector<std::wstring>& warnings)
+{
+    // An upgrade from a per-user build has to be torn down first, or the two
+    // registrations fight over the same file types (see CleanupLegacyUserInstall).
+    StopHotkey();
+    CleanupLegacyUserInstall();
+
     const std::wstring root = GetProgDir();
     if (!EnsureDir(root))
         return L"无法创建安装目录：" + root + L"\n请确认该目录可写。";
@@ -583,11 +654,25 @@ static std::wstring DoInstall(const std::vector<std::wstring>& files)
     // Copy THIS installer as the uninstaller (it may itself be running, so a
     // plain overwrite of an old copy could fail; InstallFile handles that).
     {
+        const std::wstring selfDst = root + L"\\FileRemarksSetup.exe";
         WCHAR self[MAX_PATH] = { 0 };
         GetModuleFileNameW(nullptr, self, MAX_PATH);
-        std::wstring err;
-        if (!InstallFile(self, root + L"\\FileRemarksSetup.exe", err))
-            Log(L"installer copy failed: " + err); // not fatal
+        // Re-installing THROUGH the installed copy means source == destination.
+        // CopyFileW rejects that with ERROR_SHARING_VIOLATION (0x20), and
+        // InstallFile's "rename it aside first" recovery would then move away the
+        // very file it was about to copy from. Skipping it is correct: the copy
+        // that is running already IS the uninstaller.
+        if (_wcsicmp(self, selfDst.c_str()) != 0)
+        {
+            std::wstring err;
+            if (!InstallFile(self, selfDst, err))
+            {
+                // Without this copy "应用和功能" cannot uninstall later, so the
+                // user must be told even though the product itself works.
+                Log(L"installer copy failed: " + err); // not fatal
+                warnings.push_back(L"安装程序副本没有写入，卸载后目录可能残留（详见日志）");
+            }
+        }
     }
 
     std::wstring rerr;
@@ -598,14 +683,18 @@ static std::wstring DoInstall(const std::vector<std::wstring>& files)
         return L"注册右键菜单失败。\n" + rerr + L"\n请检查 " + dst +
                L"\\FileRemarksShellExt.dll 是否被安全软件拦截。";
 
-    WriteUninstallEntry(root + L"\\FileRemarksSetup.exe");
+    if (!WriteUninstallEntry(root + L"\\FileRemarksSetup.exe"))
+        warnings.push_back(L"“应用和功能”里没有写入卸载条目，卸载时可能找不到本软件");
 
     // Install or restart the Shift+F2 helper so the shortcut works straight
-    // away. A failure here is worth a log line but not a failed install: the
-    // editor and the 备注 column work without it.
+    // away. A failure here is worth a log line and a warning, but not a failed
+    // install: the editor and the 备注 column work without it.
     StopHotkey();
     if (!WriteRunEntry(dst + L"\\FileRemarksHotkey.exe"))
+    {
         Log(L"auto-start entry failed");
+        warnings.push_back(L"开机启动项没有写入，重启电脑后 Shift+F2 需要先运行一次程序");
+    }
     StartHotkey(dst);
 
     // The previous version's folder is still mapped by explorer.exe, so its
@@ -615,7 +704,10 @@ static std::wstring DoInstall(const std::vector<std::wstring>& files)
     return L"";
 }
 
-static std::wstring DoUninstall()
+// `warnings` reports registrations that could not be removed. The uninstall
+// still returns "" (err means "stopped, this did not complete"), but the result
+// box must say it was only partial rather than claim a clean removal.
+static std::wstring DoUninstall(std::vector<std::wstring>& warnings)
 {
     const std::wstring dst = GetProgDir();
 
@@ -626,12 +718,17 @@ static std::wstring DoUninstall()
 
     // Unregister every copy that could be the registered one: the flat layout
     // used up to v1.13 sits in the root, newer installs sit in app-* folders.
+    int unregisterFailed = 0;
     for (const auto& dir : CandidateDirs())
     {
-        UnregisterDll(dir + L"\\FileRemarksPropHandler.dll");
-        UnregisterDll(dir + L"\\FileRemarksShellExt.dll");
+        if (!UnregisterDll(dir + L"\\FileRemarksPropHandler.dll")) ++unregisterFailed;
+        if (!UnregisterDll(dir + L"\\FileRemarksShellExt.dll")) ++unregisterFailed;
     }
-    RemoveUninstallEntry();
+    if (unregisterFailed > 0)
+        warnings.push_back(L"有 " + std::to_wstring(unregisterFailed) +
+                           L" 个登记项没有卸载成功，重启后“备注”列可能仍然显示（详见日志）");
+    if (!RemoveUninstallEntry())
+        warnings.push_back(L"“应用和功能”里的卸载条目没有移除");
 
     // Whole per-version folders, plus the files of a pre-v1.14 flat install.
     CleanupOldAppDirs(std::wstring());
@@ -643,39 +740,25 @@ static std::wstring DoUninstall()
     RemoveFileLazy(dst + L"\\FileRemarksPropHandler.dll");
     RemoveFileLazy(dst + L"\\FileRemarksShellExt.dll");
 
-    WCHAR self[MAX_PATH] = { 0 };
-    GetModuleFileNameW(nullptr, self, MAX_PATH);
+    // Only the copy that lives inside the install directory belongs to us.
+    // (An earlier build also scheduled the setup file the user launched from
+    // Downloads for deletion at the next boot, which silently removed a file
+    // the user still owns.)
     RemoveFileLazy(dst + L"\\FileRemarksSetup.exe");
-    if (std::wstring(self) != dst + L"\\FileRemarksSetup.exe")
-        MoveFileExW(self, nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
     if (!RemoveDirectoryW(dst.c_str()))
         MoveFileExW(dst.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
 
-    // Best effort: also clear what builds up to v1.8 left machine-wide. Without
-    // an elevated token those writes and deletes are simply refused, which is
-    // why every call here ignores its result -- the per-user state above is the
-    // one that decides whether the product is gone.
-    std::wstring legacy = GetLegacyDir();
-    if (!legacy.empty() && legacy != dst)
-    {
-        UnregisterDll(legacy + L"\\FileRemarksPropHandler.dll");
-        UnregisterDll(legacy + L"\\FileRemarksShellExt.dll");
-        RegDeleteTreeW(HKEY_LOCAL_MACHINE,
-            L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\FileRemarks");
-        RemoveFileLazy(legacy + L"\\FileRemarksEditor.exe");
-        RemoveFileLazy(legacy + L"\\FileRemarksPropHandler.dll");
-        RemoveFileLazy(legacy + L"\\FileRemarksShellExt.dll");
-        RemoveFileLazy(legacy + L"\\FileRemarksSetup.exe");
-        RemoveDirectoryW(legacy.c_str());
-    }
+    // Also clear a per-user install left by v1.9 - v1.15, if one is still there.
+    CleanupLegacyUserInstall();
     return L"";
 }
 
-// True when a machine-wide install from a build up to v1.8 is still present.
+// True when a per-user install from v1.9 - v1.15 is still present (its files
+// cannot be deleted while explorer.exe maps them, so it lingers until reboot).
 static bool LegacyInstalled()
 {
     HKEY hk = nullptr;
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+    if (RegOpenKeyExW(HKEY_CURRENT_USER,
             L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\FileRemarks",
             0, KEY_READ, &hk) == ERROR_SUCCESS)
     {
@@ -778,6 +861,31 @@ static std::wstring InstalledVersion()
 }
 
 // ---------------------------------------------------------------------------
+// The result box (v1.18)
+// ---------------------------------------------------------------------------
+
+// Set from /result=<path> when this process is the elevated child. The outer
+// instance watches the same file to know the child already reported.
+static std::wstring g_resultMarkerPath;
+
+// Show the outcome of an install/uninstall/cancel. Every path ends here, so the
+// user never gets a silently closed window: the choice dialog is closed by
+// accident more often than not, and an elevated child's box belongs to another
+// process (the outer one cannot show it).
+static void ShowResult(const fr::ResultMessage& m)
+{
+    Log(L"RESULT " + std::wstring(fr::KindName(m.kind)) + L": " + m.text);
+    // Written BEFORE the box: the parent must never observe "child finished
+    // without a result" while this box is actually on screen.
+    fr::WriteResultMarker(g_resultMarkerPath, m.kind);
+    UINT icon = MB_ICONINFORMATION;
+    if (m.kind == fr::ResultKind::Failed) icon = MB_ICONERROR;
+    else if (m.kind == fr::ResultKind::Partial) icon = MB_ICONWARNING;
+    MessageBoxW(nullptr, m.text.c_str(), L"FileRemarks " FR_VERSION_FULL,
+                MB_OK | icon | MB_SETFOREGROUND | MB_TOPMOST);
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -787,11 +895,15 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    bool uninstall = false, silent = false;
+    bool uninstall = false, silent = false, elevated = false;
     for (int i = 1; argv && i < argc; ++i)
     {
         std::wstring a = argv[i];
         if (a == L"/uninstall") { uninstall = true; silent = true; }
+        if (a == L"/elevated") elevated = true;
+        // The elevated child reports back through this marker so the outer
+        // instance can keep its mouth shut instead of showing a second box.
+        if (a.rfind(L"/result=", 0) == 0) g_resultMarkerPath = a.substr(8);
     }
     if (argv) LocalFree(argv);
 
@@ -799,20 +911,102 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         L" silent=" + std::to_wstring(silent ? 1 : 0) +
         L" uninstall=" + std::to_wstring(uninstall ? 1 : 0));
 
-    // ---- No elevation, deliberately. ----
-    // Everything this program touches lives in the current user's profile: the
-    // per-user install folder, the HKCU registration and the HKCU uninstall
-    // entry. Requesting an administrator token would add nothing except a UAC
-    // prompt and, worse, SmartScreen's "发行者未知" warning -- Windows runs that
-    // reputation check on an unsigned executable precisely when it asks to
-    // elevate, which is the dialog this build exists to remove.
+    // ---- Elevate, because the 备注 column needs a machine-wide registration. ----
+    //
+    // Property-handler associations are not an HKCU-first lookup: when Windows
+    // already ships a handler for a type (jpg, png, mp3, exe, ...), a per-user
+    // association naming another CLSID is ignored, and for .exe the built-in
+    // handler then fails with 0x80070715 and the column comes up empty. Only an
+    // HKLM entry takes that slot, and HKLM needs a token.
+    //
+    // Known cost: Windows runs its SmartScreen reputation check on an unsigned
+    // executable exactly when it asks to elevate, so this build may show
+    // 发行者未知 once per install. That dialog cannot be avoided without a
+    // purchased code-signing certificate, and it is the price of a column that
+    // works for every file type.
+    if (!IsAdmin() && !elevated)
+    {
+        WCHAR self[MAX_PATH] = { 0 };
+        if (GetModuleFileNameW(nullptr, self, MAX_PATH) == 0)
+        {
+            Msg(L"无法获取安装程序路径。", true);
+            CoUninitialize();
+            return 1;
+        }
+        // The elevated child writes a marker right before its own result box;
+        // this instance waits for the child and only speaks when nothing was
+        // reported (child killed, blocked by security software, crash).
+        const std::wstring childMarker = fr::MakeResultMarkerPath();
+        std::wstring params = L"/elevated";
+        if (uninstall) params += L" /uninstall";
+        if (!childMarker.empty())
+            params += L" /result:\"" + childMarker + L"\"";
+        SHELLEXECUTEINFOW sei = { sizeof(sei) };
+        sei.lpVerb = L"runas";
+        sei.lpFile = self;
+        sei.lpParameters = params.c_str();
+        sei.nShow = SW_SHOWNORMAL;
+        sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+        if (!ShellExecuteExW(&sei) || !sei.hProcess)
+        {
+            const DWORD elevateErr = GetLastError();
+            Log(L"elevate FAILED err=" + std::to_wstring(elevateErr));
+            // Cancelling the UAC prompt is a normal outcome, not a failure of
+            // the install: saying "需要管理员权限" there would leave the user
+            // wondering what happened, since they had just said no.
+            if (elevateErr == ERROR_CANCELLED)
+                Msg(L"已取消：UAC 提权被取消，没有安装或卸载任何内容。"
+                    L"\n\n如仍要继续，请重新运行本程序，并在 UAC 提示中点“是”。",
+                    true);
+            else
+                Msg(L"需要管理员权限才能安装。"
+                    L"\n\n“备注”列必须登记在机器范围内（HKLM）：Windows 对 exe、jpg、png、mp3"
+                    L"这些自带属性处理器的类型只认这项登记，只登记到当前用户的话，这些类型的"
+                    L"备注列会是空的。" L"\n\n请在提示 UAC 时点“是”。"
+                    L"\n（错误码 0x" + Hex(elevateErr) + L"）",
+                    true);
+            CoUninitialize();
+            return 1;
+        }
+        // A machine that runs an on-access scanner can make a first run take a
+        // long time; waiting far longer costs nothing because the box only shows
+        // up if the child really failed to report.
+        const DWORD wait = WaitForSingleObject(sei.hProcess, 45 * 60 * 1000);
+        DWORD code = 0;
+        GetExitCodeProcess(sei.hProcess, &code);
+        CloseHandle(sei.hProcess);
+        Log(L"elevated run finished code=" + std::to_wstring(code) +
+            L" wait=" + std::to_wstring(wait));
+        if (fr::ResultMarkerExists(childMarker))
+        {
+            // The child reported; a second box here would be exactly the
+            // confusion this release exists to remove.
+            Log(L"child reported a result, outer instance stays silent");
+            fr::DeleteResultMarker(childMarker);
+        }
+        else
+        {
+            Log(L"child left no result marker, showing fallback box (code=" +
+                std::to_wstring(code) + L")");
+            ShowResult(fr::BuildNoResultResult(fr::LogPath(), wait == WAIT_TIMEOUT, code));
+        }
+        CoUninitialize();
+        return 0;
+    }
 
     // ---- Ask what to do, showing the installed version against this one. ----
+    // Everything the final box needs, captured before the action runs: after a
+    // successful re-install IsInstalled() is true, so "was it installed
+    // before?" cannot be answered afterwards.
+    const bool wasInstalled = IsInstalled();
+    const bool legacyWasInstalled = LegacyInstalled();
+    std::vector<std::wstring> warnings;
+
     bool doUninstall = uninstall;
     std::wstring installedVersion;
     if (!silent)
     {
-        bool installed = IsInstalled();
+        bool installed = wasInstalled;
         if (installed) installedVersion = InstalledVersion();
         Log(L"choice dialog (installed=" + std::to_wstring(installed ? 1 : 0) +
             L", version=" + installedVersion + L", new=v" FR_VERSION_TEXT L")");
@@ -822,22 +1016,37 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
                                               GetModuleHandleW(nullptr));
         Log(L"choice=" + std::to_wstring(choice));
 
-        if (choice == fr::ui::kChoiceCancel) { Log(L"cancelled"); CoUninitialize(); return 0; }
+        // Closing the window is a real outcome and must say so: previously it
+        // returned silently and looked like the installer had hung or failed.
+        if (choice == fr::ui::kChoiceCancel)
+        {
+            Log(L"cancelled");
+            ShowResult(fr::BuildCancelResult());
+            CoUninitialize();
+            return 3; // cancelled: nothing was changed
+        }
         doUninstall = (choice == fr::ui::kChoiceUninstall);
     }
 
     Log(doUninstall ? L"action=uninstall" : L"action=install");
 
+    // 0 = 完成，1 = 失败，2 = 部分完成，3 = 已取消. The elevated child returns
+    // it so the outer instance can at least distinguish "nothing was reported"
+    // from "it really failed" (see BuildNoResultResult).
+    int exitCode = 0;
     try
     {
         std::wstring err;
         if (doUninstall)
         {
-            err = DoUninstall();
+            err = DoUninstall(warnings);
             if (err.empty())
             {
                 Log(L"uninstall OK");
-                Msg(L"已卸载。\n重启“资源管理器”或注销后生效（安装目录将在下次重启时清除）。");
+                const fr::ResultMessage m =
+                    fr::BuildUninstallResult(GetProgDir(), warnings);
+                exitCode = m.kind == fr::ResultKind::Ok ? 0 : 2;
+                ShowResult(m);
             }
         }
         else
@@ -859,7 +1068,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
             err = ExtractPayload(selfPath, dir, files);
             Log(L"extract -> " + std::to_wstring(files.size()) + L" files, err=" + err);
 
-            if (err.empty()) err = DoInstall(files);
+            if (err.empty()) err = DoInstall(files, warnings);
 
             for (auto& f : files) DeleteFileW(f.c_str());
             RemoveDirectoryW(dir.c_str());
@@ -874,39 +1083,33 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
                 const int cols = QueryColumnCount(asked + L"\\FileRemarksPropHandler.dll");
                 Log(L"column types enabled=" + std::to_wstring(cols));
 
-                std::wstring msg =
-                    L"安装完成！\n\n在任意文件上点右键 -> “编辑备注” 即可使用。\n"
-                    L"也可以先选中一个文件，按 Shift+F2 直接打开备注。\n";
-                if (cols >= 6)
-                    msg += L"资源管理器里的“备注”列也已经默认打开。\n";
-                else if (cols > 0)
-                    msg += L"资源管理器里的“备注”列已经打开（" + std::to_wstring(cols) +
-                           L" 种文件夹类型，其余的可手动添加）。\n";
-                else
-                    msg += L"“备注”列没能自动打开，可以在资源管理器里右键列标题手动勾选“备注”。\n";
-                msg += L"\n首次使用请重启“资源管理器”或注销重登录。";
-                // An older machine-wide build can still be lying around in
-                // Program Files; this user-scoped registration supersedes it, so
-                // nothing is broken, but telling the user keeps it unsurprising.
-                if (LegacyInstalled())
-                    msg += L"\n\n旧版本留下的 C:\\Program Files\\FileRemarks 目录已经不再使用，"
-                           L"想清理的话需要管理员权限删除它。";
-                Msg(msg);
+                // The box names the directory and version, so a re-install into
+                // a fresh app-<ver> folder is visible and not a guess.
+                const fr::ResultMessage m = fr::BuildInstallResult(
+                    wasInstalled, asked, FR_VERSION_FULL, cols,
+                    legacyWasInstalled, warnings);
+                exitCode = m.kind == fr::ResultKind::Ok ? 0 : 2;
+                ShowResult(m);
             }
         }
 
         if (!err.empty())
         {
             Log(L"FAILED: " + err);
-            Msg(err + L"\n\n（诊断日志：%TEMP%\\FileRemarks_log.txt）", true);
+            exitCode = 1;
+            ShowResult(fr::BuildFailureResult(
+                doUninstall ? fr::Action::Uninstall : fr::Action::Install, err));
         }
     }
     catch (...)
     {
         Log(L"EXCEPTION thrown");
-        Msg(L"安装程序内部错误（已记录日志）。\n\n诊断日志：%TEMP%\\FileRemarks_log.txt", true);
+        exitCode = 1;
+        ShowResult(fr::BuildFailureResult(
+            doUninstall ? fr::Action::Uninstall : fr::Action::Install,
+            L"安装程序内部错误（已记录日志）。"));
     }
 
     CoUninitialize();
-    return 0;
+    return exitCode;
 }

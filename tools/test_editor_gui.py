@@ -27,7 +27,6 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORK = os.path.join(ROOT, "build", "_editor_gui_test")
 
 # Must match the enum in src/FileRemarksEditor.cpp.
-IDC_FILENAME = 101
 IDC_REMARK = 102
 IDC_STATUS = 103
 
@@ -45,8 +44,6 @@ ICON_SMALL = 0
 ICON_BIG = 1
 WA_INACTIVE = 0
 
-# Must match SZ_HINT in src/FileRemarksEditor.cpp.
-HINT = "直接输入备注，关闭窗口或切到别的窗口时会自动保存。"
 
 SW_SHOWNORMAL = 1
 
@@ -194,23 +191,25 @@ def main():
             print("  the editor window never appeared")
             return 1
         print("  main window: %r" % window_text(hwnd))
-        # The product name used to be painted into the window and the title bar;
-        # both were removed on request, so the title must be just the property
-        # name and must not contain the old wording anywhere.
+        # The title bar carries the file NAME and nothing else: no "备注", no
+        # version number, no folder. A native caption also left-aligns it for
+        # free, which is the layout asked for.
         title = window_text(hwnd)
-        if "文件备注" in title:
-            failures.append("window title still contains the removed wording: %r" % title)
-        if title != "备注":
-            failures.append("window title is %r, expected just the property name" % title)
+        if title != os.path.basename(target):
+            failures.append("window title is %r, expected the file name %r"
+                            % (title, os.path.basename(target)))
 
-        file_box = user32.GetDlgItem(hwnd, IDC_FILENAME)
         remark_box = user32.GetDlgItem(hwnd, IDC_REMARK)
         status = user32.GetDlgItem(hwnd, IDC_STATUS)
-        for name, h in (("filename", file_box), ("remark", remark_box),
-                        ("status", status)):
+        for name, h in (("remark", remark_box), ("status", status)):
             print("  control %-9s hwnd=%s" % (name, h))
             if not h:
                 failures.append("control %s not found" % name)
+        # The full-path row is gone: nothing may be left at the old control id.
+        path_box = user32.GetDlgItem(hwnd, 101)
+        print("  removed path row (id 101) -> %s" % path_box)
+        if path_box:
+            failures.append("the file path row is still there")
         for cid, label in IDC_GONE.items():
             h = user32.GetDlgItem(hwnd, cid)
             print("  removed button %r (id %d) -> %s" % (label, cid, h))
@@ -218,10 +217,6 @@ def main():
                 failures.append("button %s (id %d) is still there" % (label, cid))
         if failures:
             return 1
-
-        print("  filename control shows: %r" % get_text(file_box))
-        if os.path.basename(target) not in get_text(file_box):
-            failures.append("filename control does not show the target file")
 
         # The window must carry our own logo, not the generic default icon --
         # that is what makes the tool recognisable in the task bar.
@@ -235,8 +230,10 @@ def main():
         # simply start typing.
         print("  remark box starts as: %r" % get_text(remark_box))
         print("  status line: %r" % get_text(status))
-        if get_text(status) != HINT:
-            failures.append("status line is not the auto-save hint: %r"
+        # The permanent hint that used to sit under the box was removed on
+        # request, so an idle window shows nothing there.
+        if get_text(status) != "":
+            failures.append("the status line should start empty, got %r"
                             % get_text(status))
 
         # The window must actually be painted in the Win11 palette, not left as
@@ -326,14 +323,13 @@ def main():
         send_text(remark_box, second)
         time.sleep(0.1)
 
-        # An idle window that just loses focus again must NOT rewrite the file.
-        # (The hint itself contains the word 自动保存, so the check is that the
-        # status went back to the hint rather than showing a save confirmation.)
+        # An idle window that just loses focus again must NOT rewrite the file,
+        # and must not claim a save either -- the line goes blank again.
         user32.SendMessageW(hwnd, WM_ACTIVATE, c_void_p(WA_INACTIVE), None)
         time.sleep(0.3)
         status2 = get_text(user32.GetDlgItem(hwnd, IDC_STATUS))
         print("  status after a second (idle) deactivation: %r" % status2)
-        if status2 != HINT:
+        if status2 != "":
             failures.append("an unedited window reported a save: %r" % status2)
 
         # --- round 4: clearing = deleting the text, then closing ---------

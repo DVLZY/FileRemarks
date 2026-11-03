@@ -11,22 +11,24 @@
 // so the column works for Office documents too, whose own metadata handler we
 // must not replace (see src/native_comment.h).
 //
-// There are deliberately NO buttons: the remark is saved automatically when the
-// window is closed or when it loses the foreground, so editing is just "type,
-// then click away". Losing focus NEVER closes the window -- it only saves, and
-// the window stays open exactly where it is. Clearing a remark is simply
-// deleting its text. Esc closes the window, Ctrl+Enter does the same (both save
-// first); plain Enter inserts a newline.
+// There are deliberately NO buttons: losing the foreground saves and closes the
+// window ("type, then click away"), and so do the X button and Ctrl+Enter.
+// A save that fails keeps the window open with the reason in the status line,
+// so nothing is lost silently. An untouched window closes without writing
+// anything. Esc is 取消: it closes without saving even if text was typed.
+// Clearing a remark is simply deleting its text; plain Enter inserts a newline.
 //
-// The look follows Windows 11 -- light page, one rounded white box, Segoe UI,
-// accent-coloured focus ring and rounded window corners -- and is painted by
-// hand with plain GDI (see src/theme.h), so there is no .rc file and no resource
-// compiler in the build.
+// The look follows Windows 11 -- flat page, one rounded input surface, Segoe UI,
+// rounded window corners, and both the light and the dark palette -- and is
+// painted by hand with plain GDI (see src/theme.h), so there is no .rc file and
+// no resource compiler in the build. There is deliberately no focus ring: the
+// caret is the focus, and the window holds exactly one editable surface.
 //
-// The window is deliberately reduced to three things: the logo, the file's path
-// (directly beside the logo, with no "文件" label), and the remark box. An empty
-// remark box shows the cue text "在这输入备注..." which disappears the moment
-// anything is typed.
+// The window is deliberately reduced to two things: a title bar carrying the
+// file NAME (a native caption, so it is left-aligned and elided by Windows
+// itself), and one remark box. No path row, no labels, no buttons, and no
+// scrollbar. An empty remark box shows the cue text "在这输入备注..." which
+// disappears the moment anything is typed.
 //
 // Usage: FileRemarksEditor.exe "<file path>"
 // ---------------------------------------------------------------------------
@@ -43,6 +45,7 @@
 #include "native_comment.h"
 #include "logo.h"
 #include "theme.h"
+#include "version.h"
 
 #pragma comment(linker, "\"/MANIFESTDEPENDENCY:type='win32' \
 name='Microsoft.Windows.Common-Controls' version='6.0.0.0' \
@@ -50,13 +53,16 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 // Control IDs.
 enum {
-    IDC_FILENAME = 101,
-    IDC_REMARK   = 102,
-    IDC_STATUS   = 103,
+    IDC_REMARK = 102,
+    IDC_STATUS = 103,
 };
 
-// Client width in 96-DPI units; the height is measured from the wrapped file
-// path so a long path is always shown in full instead of being clipped.
+// The status line clears itself after this long, so the window never keeps a
+// line of text sitting under the input area.
+static const UINT_PTR kStatusTimer = 1;
+
+// Client width in 96-DPI units. The height follows from the layout, which is
+// fixed now: one card plus a one-line status strip.
 static const int CLIENT_W = 464;
 
 // Fixed-size, non-resizable frame: the window is sized to its content, so a
@@ -65,11 +71,15 @@ static const DWORD kWindowStyle =
     (WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX);
 
 static std::wstring g_filePath;
+// Base name only -- it is the entire title bar, so no row of the window is
+// spent repeating what the title already says.
+static std::wstring g_fileName;
 static HWND    g_hRemark = nullptr;
 static HWND    g_hStatus = nullptr;
-static HWND    g_hFile   = nullptr;
+static HWND    g_hMain   = nullptr;
 static HFONT   g_fBody   = nullptr;
 static HFONT   g_fSmall  = nullptr;
+static HFONT   g_fTiny   = nullptr;
 static HICON   g_hIconBig = nullptr;
 static HICON   g_hIconSmall = nullptr;
 static HICON   g_hIconPaint = nullptr;
@@ -86,137 +96,87 @@ static int S(int v) { return MulDiv(v, g_dpi, 96); }
 // misleading "saved" message).
 static std::wstring g_savedText;
 
-static const WCHAR SZ_HINT[] =
-    L"直接输入备注，关闭窗口或切到别的窗口时会自动保存。";
+// Set while Esc is closing the window: WM_CLOSE then closes without writing
+// anything, so "Esc 取消" really means discard rather than "cancel, but save".
+static bool g_fDiscard = false;
+
+// True while a focus loss is already being handled. Destroying the window, or
+// the status update that the save itself triggers, can produce another
+// WM_ACTIVATE(WA_INACTIVE); it must not start a second save in that case.
+static bool g_fBlurClosing = false;
 
 // Placeholder shown inside an empty remark box. It is painted, never stored, so
 // it can never be mistaken for content or saved by accident.
 static const WCHAR SZ_PLACEHOLDER[] = L"在这输入备注...";
 
-// Measured layout, in scaled pixels, filled by ComputeLayout() before the
-// window exists so the window can be sized to fit the whole file path.
-static RECT g_rcIcon;
-static RECT g_rcPath;
-static RECT g_rcHeaderCard;
+// Layout in scaled pixels, filled by ComputeLayout() before the window exists
+// so the window can be created at its final size in one go.
 static RECT g_rcRemarkCard;
 static RECT g_rcRemarkEdit;
 static RECT g_rcStatus;
 static int  g_clientH = 0;
 
-// Slack added to the path box after the real EDIT control reported that it still
-// could not show every wrapped line. The pre-window estimate below is only an
-// estimate: an edit control keeps a small internal margin, so the box that
-// "should" fit exactly one line more can come up a few pixels short. Once the
-// control exists we ask IT how many lines it has and how much room it has, and
-// grow the box by exactly the shortfall (see FitPathControl) -- that is what
-// guarantees the file name is never clipped.
-static int  g_pathPad = 0;
-
 static void CreateFonts()
 {
     if (g_fBody) return;
-    g_fBody  = fr::theme::Font(S(15), FW_NORMAL);
-    g_fSmall = fr::theme::Font(S(12), FW_NORMAL);
+    g_fBody  = fr::theme::Font(S(14), FW_NORMAL);
+    g_fSmall = fr::theme::Font(S(11), FW_NORMAL);
+    g_fTiny  = fr::theme::Font(S(10), FW_NORMAL);
 }
 
-// Line height of a font, exactly as the control will lay the text out.
-static int LineHeightPx(HDC hdc, HFONT font)
-{
-    HGDIOBJ oldFont = SelectObject(hdc, font);
-    TEXTMETRICW tm = { 0 };
-    GetTextMetricsW(hdc, &tm);
-    SelectObject(hdc, oldFont);
-    return tm.tmHeight > 0 ? tm.tmHeight : S(16);
-}
-
-// How many lines a multiline EDIT will use for `text` at `width` pixels.
-//
-// Counted by CHARACTER, because that is exactly what an edit control does.
-// DrawTextW with DT_WORDBREAK only breaks at spaces, and a file path contains
-// none -- it would report far fewer lines than the control really needs, and the
-// last lines got clipped (the bug this measurement replaces).
-static int CountLines(HDC hdc, HFONT font, const std::wstring& text, int width)
-{
-    if (width <= S(8) || text.empty()) return 1;
-
-    HGDIOBJ oldFont = SelectObject(hdc, font);
-    int lines = 1;
-    size_t pos = 0;
-    while (pos < text.size() && lines < 64)
-    {
-        int fit = 0;
-        SIZE extent = { 0, 0 };
-        if (!GetTextExtentExPointW(hdc, text.c_str() + pos,
-                                   (int)(text.size() - pos), width,
-                                   &fit, nullptr, &extent))
-            break;
-        if (fit <= 0) break;
-        pos += (size_t)fit;
-        if (pos < text.size()) ++lines;
-    }
-    SelectObject(hdc, oldFont);
-    return lines;
-}
-
-// Two things only, top to bottom: a card holding the logo with the file path
-// immediately to its right (no "文件" label), and the remark box (no "备注"
-// label). The path is measured line by line so it is never clipped, and the
-// window is sized to whatever that works out to.
+// The remark surface fills most of the window: a 464x238 client cannot offer a
+// second row of chrome without taking space away from the text. Below it sits a
+// single footer line that carries the version number on the right and a save
+// failure on the left -- nothing else. The box is inset 16 from the card on all
+// four sides, so the text never touches the 1px outline.
 static void ComputeLayout()
 {
-    const int left  = S(16);
-    const int right = S(CLIENT_W - 16);
-    const int padIn = S(14);
+    const int left    = S(12);
+    const int right   = S(CLIENT_W - 12);
+    const int cardTop = S(12);
+    const int cardH   = S(188);
 
-    HDC hdc = GetDC(nullptr);
-    const int lineH = hdc ? LineHeightPx(hdc, g_fSmall) : S(16);
+    g_rcRemarkCard = { left, cardTop, right, cardTop + cardH };
+    g_rcRemarkEdit = { left + S(16), cardTop + S(16),
+                       right - S(16), cardTop + cardH - S(16) };
 
-    // Header card: logo, then the path right beside it.
-    const int cardTop  = S(12);
-    const int iconSize = S(24);
-    const int iconTop  = cardTop + S(12);
-    g_rcIcon = { left + padIn, iconTop, left + padIn + iconSize, iconTop + iconSize };
-
-    const int pathLeft  = g_rcIcon.right + S(10);
-    const int pathRight = right - padIn;
-    // The edit insets its own text by a couple of pixels, so measure against a
-    // slightly narrower box: over-counting one line is harmless, under-counting
-    // clips the text.
-    const int lines = hdc ? CountLines(hdc, g_fSmall, g_filePath,
-                                       (pathRight - pathLeft) - S(6)) : 1;
-    const int pathH = lines * lineH + S(4) + g_pathPad;
-
-    // One line of text sits centred against the logo; a long path starts level
-    // with it and simply makes the card taller.
-    int pathTop = iconTop + (iconSize - pathH) / 2;
-    if (pathTop < iconTop) pathTop = iconTop;
-
-    g_rcPath = { pathLeft, pathTop, pathRight, pathTop + pathH };
-
-    const int contentBottom = pathTop + pathH > iconTop + iconSize
-                            ? pathTop + pathH : iconTop + iconSize;
-    g_rcHeaderCard = { left, cardTop, right, contentBottom + S(12) };
-
-    if (hdc) ReleaseDC(nullptr, hdc);
-
-    // Remark card: one box, no label on top of it -- the placeholder inside says
-    // what it is, so a whole row of text is saved.
-    const int remarkTop = g_rcHeaderCard.bottom + S(10);
-    const int remarkH   = S(168);
-    g_rcRemarkCard = { left, remarkTop, right, remarkTop + remarkH };
-    g_rcRemarkEdit = { left + S(12), remarkTop + S(10),
-                       right - S(12), remarkTop + remarkH - S(10) };
-
-    g_rcStatus = { left, g_rcRemarkCard.bottom + S(8), right,
-                   g_rcRemarkCard.bottom + S(8) + S(18) };
-    g_clientH = g_rcStatus.bottom + S(10);
+    // Footer band: 4px under the card, 4px above the bottom edge. Version 1.22
+    // and a failure message share one baseline so neither moves when the other
+    // appears.
+    g_rcStatus = { left + S(4), g_rcRemarkCard.bottom + S(4),
+                   right - S(4), g_rcRemarkCard.bottom + S(34) };
+    g_clientH = S(238);
 }
 
-static void SetStatus(const std::wstring& msg)
+// Two independent things decide how a message looks:
+//   * `sticky` -- it stays until replaced (anything the user must be able to
+//     re-read), instead of fading out after a couple of seconds;
+//   * `error`  -- it is painted in the error colour. Only a failed WRITE is an
+//     error; the informational warnings loaded with the file ("the column will
+//     not show this remark") stay neutral so red keeps meaning "something
+//     failed right now".
+static bool g_statusError = false;
+
+static void SetStatus(const std::wstring& msg, bool sticky = false,
+                      bool error = false)
 {
     if (!g_hStatus) return;
+    g_statusError = error;
     SetWindowTextW(g_hStatus, msg.c_str());
     // The text is painted by the parent, so repaint that strip.
+    RECT r = g_rcStatus;
+    InvalidateRect(GetParent(g_hStatus), &r, FALSE);
+    if (!g_hMain) return;
+    KillTimer(g_hMain, kStatusTimer);
+    if (!msg.empty() && !sticky) SetTimer(g_hMain, kStatusTimer, 2500, nullptr);
+}
+
+static void ClearStatus()
+{
+    if (!g_hStatus) return;
+    g_statusError = false;
+    if (g_hMain) KillTimer(g_hMain, kStatusTimer);
+    SetWindowTextW(g_hStatus, L"");
     RECT r = g_rcStatus;
     InvalidateRect(GetParent(g_hStatus), &r, FALSE);
 }
@@ -232,13 +192,63 @@ static std::wstring GetRemarkText()
     return text;
 }
 
+// OOXML documents (.docx/.pptx/.xlsx). Their own property handlers are the only
+// thing Explorer can read a remark from, and a handler can only open a real
+// package: a 0-byte "新建 ..." placeholder cannot carry metadata at all.
+static bool IsOoxmlDocument(const std::wstring& path)
+{
+    const WCHAR* exts[] = {
+        L".docx", L".docm", L".dotx", L".dotm",
+        L".pptx", L".pptm", L".potx", L".potm",
+        L".xlsx", L".xlsm", L".xlsb", L".xltx", L".xltm"
+    };
+    const WCHAR* dot = wcsrchr(path.c_str(), L'.');
+    if (!dot) return false;
+    for (size_t i = 0; i < ARRAYSIZE(exts); ++i)
+        if (_wcsicmp(dot, exts[i]) == 0) return true;
+    return false;
+}
+
 static void LoadRemark()
 {
     std::wstring shown;
     std::wstring remark;
+    std::wstring note;
+    bool sticky = false;
+
     if (fr::ReadRemark(g_filePath, remark) && !remark.empty())
     {
         shown = remark;
+        // For documents whose column Windows serves from the file's own metadata
+        // (Office types above all) an ADS-only remark is invisible in Explorer.
+        // Mirror it once so an existing remark starts showing up in the column,
+        // but never overwrite a comment the document already carries.
+        if (!fr::HandlerIsOurs(g_filePath))
+        {
+            std::wstring native;
+            bool exists = false;
+            // Only when a native store actually opened: types with no handler at
+            // all must not produce a warning they cannot act on.
+            const bool opened = fr::ReadNativeComment(g_filePath, native, exists);
+            if (!opened && IsOoxmlDocument(g_filePath))
+            {
+                note = L"这个 Office 文件读不出文档属性（多半是 0 字节的空文档或已损坏），"
+                       L"资源管理器“备注”列需要文件里存得下备注才会显示；"
+                       L"用 Office 打开并保存一次后就会恢复。";
+                sticky = true;
+            }
+            else if (opened && !exists)
+            {
+                if (fr::WriteNativeCommentIfNeeded(g_filePath, remark))
+                    note = L"已把备注同步到文档属性，资源管理器列可以显示。";
+                else
+                {
+                    note = L"备注已存在，但没能写入文档属性（文件可能正被 Office 占用或只读），"
+                           L"资源管理器“备注”列暂时不显示。";
+                    sticky = true;
+                }
+            }
+        }
     }
     else
     {
@@ -247,12 +257,25 @@ static void LoadRemark()
         // hidden.
         std::wstring native;
         bool exists = false;
-        if (fr::ReadNativeComment(g_filePath, native, exists) && exists)
+        const bool opened = fr::ReadNativeComment(g_filePath, native, exists);
+        if (opened && exists)
             shown = native;
+        else if (!opened && !fr::HandlerIsOurs(g_filePath) && IsOoxmlDocument(g_filePath))
+        {
+            // A 0-byte Explorer placeholder is not a package yet, so no handler
+            // can store System.Comment in it -- this is the one case where the
+            // column stays empty no matter what we write. Say so instead of
+            // letting the user believe the remark was saved and lost.
+            note = L"这个 Office 文件读不出文档属性（多半是 0 字节的空文档或已损坏），"
+                   L"资源管理器“备注”列需要文件里存得下备注才会显示；"
+                   L"用 Office 打开并保存一次后就会恢复。";
+            sticky = true;
+        }
     }
     SetWindowTextW(g_hRemark, shown.c_str());
     g_savedText = shown;
-    SetStatus(SZ_HINT);
+    ClearStatus();
+    if (!note.empty()) SetStatus(note, sticky);
 }
 
 // Ask Explorer to re-read this one item so the 备注 column shows the new value
@@ -279,15 +302,32 @@ static void NotifyShell()
     }
 }
 
+// Whether a window belongs to this process. A message box, a common dialog or
+// any other window of ours deactivates the main window exactly like clicking
+// another application does, and that must never be read as "the user left".
+static bool IsOwnWindow(HWND hWnd)
+{
+    if (!hWnd) return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hWnd, &pid);
+    return pid == GetCurrentProcessId();
+}
+
 // Writes the current text if it differs from what is already stored, and
 // reports the outcome in the status line. Called on close and on deactivation.
-static void SaveIfChanged()
+//
+// Returns true when the window may be closed afterwards: either nothing had to
+// be written (the text is unchanged -- an untouched window closes silently and
+// leaves the file alone) or the write fully succeeded. False means the window
+// has to stay open, with the reason already shown in the status line, so the
+// user can retry or keep editing instead of losing the text.
+static bool SaveIfChanged()
 {
     const std::wstring text = GetRemarkText();
     if (text == g_savedText)
     {
-        SetStatus(SZ_HINT);
-        return;
+        ClearStatus();
+        return true;
     }
 
     // Show that the work has started and force it onto the screen before the
@@ -299,22 +339,37 @@ static void SaveIfChanged()
 
     bool ok = fr::WriteRemark(g_filePath, text);
     // For types we do not own a handler for (Office documents above all) the
-    // column can only come from the file's own metadata. Best effort: a refusal
-    // here is normal and must not look like an error.
-    fr::WriteNativeCommentIfNeeded(g_filePath, text);
+    // column can only come from the file's own metadata. That write can fail --
+    // the file may be open in Word, or read-only -- and reporting "已自动保存"
+    // then would be exactly the "看不出到底成没成功" problem this release is
+    // about, because the 备注 column stays empty.
+    const bool owned = fr::HandlerIsOurs(g_filePath);
+    const bool nativeOk = fr::WriteNativeCommentIfNeeded(g_filePath, text);
 
     if (ok)
     {
-        g_savedText = text;
         // Push the change to Explorer right away; without this the column can
         // keep showing the old text until the view is refreshed by hand.
         NotifyShell();
-        SetStatus(text.empty() ? L"备注已清空（自动保存）。" : L"已自动保存。");
+        if (!owned && !nativeOk)
+        {
+            // The remark is stored in the ADS but the file itself still does not
+            // carry it, so the column cannot show it yet: that counts as a failed
+            // save and the window stays open, exactly like a hard failure. The
+            // saved text is not updated either, so retrying really retries.
+            SetStatus(L"已保存到文件；但文档属性写入失败（文件可能正被 Office 占用或只读），"
+                      L"资源管理器“备注”列暂时不会显示。", true, true);
+            return false;
+        }
+        g_savedText = text;
+        // Success is deliberately silent: the window closes on the same action,
+        // so a "已自动保存" line would flash for one frame and never be read.
+        ClearStatus();
+        return true;
     }
-    else
-    {
-        SetStatus(L"保存失败（文件可能只读或不可写）。");
-    }
+
+    SetStatus(L"保存失败（文件可能只读或不可写）。", true, true);
+    return false;
 }
 
 // The remark box draws the cue text itself when it is empty: the control paints
@@ -332,7 +387,7 @@ static void PaintPlaceholder(HWND hWnd)
 
     HGDIOBJ oldFont = SelectObject(hdc, g_fBody);
     const int oldBk = SetBkMode(hdc, TRANSPARENT);
-    const COLORREF oldColor = SetTextColor(hdc, fr::theme::kMuted);
+    const COLORREF oldColor = SetTextColor(hdc, fr::theme::Colors().muted);
     DrawTextW(hdc, SZ_PLACEHOLDER, -1, &fr, DT_LEFT | DT_TOP | DT_NOPREFIX);
     SetTextColor(hdc, oldColor);
     SetBkMode(hdc, oldBk);
@@ -410,8 +465,9 @@ static void DeleteWordBeforeCaret(HWND hWnd)
 // to a focused window (and it keeps the shortcut testable when the window cannot
 // take the foreground, e.g. under automation).
 //
-// Focus changes only repaint the accent ring around the card -- they never
-// close anything (the save itself happens in WM_ACTIVATE below).
+// Focus changes only repaint the accent ring around the card; the closing
+// decision is made by the main window (WM_ACTIVATE for a real focus loss,
+// WM_CLOSE for Esc / Ctrl+Enter / the X button).
 static LRESULT CALLBACK RemarkEditProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg)
@@ -419,11 +475,16 @@ static LRESULT CALLBACK RemarkEditProc(HWND hWnd, UINT msg, WPARAM wParam, LPARA
     case WM_KEYDOWN:
         if (wParam == VK_ESCAPE)
         {
+            // Esc is 取消: close without saving anything, even if the text was
+            // edited. WM_CLOSE honours the flag instead of saving.
+            g_fDiscard = true;
             PostMessageW(GetParent(hWnd), WM_CLOSE, 0, 0);
             return 0;
         }
         if (wParam == VK_RETURN && (GetAsyncKeyState(VK_CONTROL) & 0x8000))
         {
+            // Ctrl+Enter is 保存: same path as blurring out of the window, so a
+            // failed save keeps the window open here too.
             PostMessageW(GetParent(hWnd), WM_CLOSE, 0, 0);
             return 0;
         }
@@ -487,7 +548,8 @@ static LRESULT CALLBACK RemarkEditProc(HWND hWnd, UINT msg, WPARAM wParam, LPARA
 
     case WM_SETFOCUS:
     case WM_KILLFOCUS:
-        InvalidateRect(GetParent(hWnd), nullptr, FALSE);
+        // Nothing on the page reacts to focus any more: the caret is the only
+        // focus signal, and the control paints its own.
         break;
     }
     return CallWindowProcW(g_oldEditProc, hWnd, msg, wParam, lParam);
@@ -495,19 +557,13 @@ static LRESULT CALLBACK RemarkEditProc(HWND hWnd, UINT msg, WPARAM wParam, LPARA
 
 static void CreateChildren(HWND hWnd)
 {
-    // File path: a borderless read-only multiline edit right beside the logo.
-    // Multiline + read-only makes the control wrap the text itself, character by
-    // character, so even a very long path is shown in full instead of clipped.
-    g_hFile = CreateWindowExW(0, L"EDIT", g_filePath.c_str(),
-        WS_CHILD | WS_VISIBLE | ES_READONLY | ES_MULTILINE | ES_NOHIDESEL,
-        g_rcPath.left, g_rcPath.top,
-        g_rcPath.right - g_rcPath.left, g_rcPath.bottom - g_rcPath.top,
-        hWnd, (HMENU)IDC_FILENAME, nullptr, nullptr);
-
-    // Remark: borderless multiline box filling the card. When it is empty the
-    // control paints the cue text itself (see PaintPlaceholder).
+    // The remark box is the only control. No WS_VSCROLL on purpose: the box is
+    // tall enough for a normal remark, and a scrollbar would eat width for the
+    // rare long one. ES_AUTOVSCROLL is what lets the control scroll its own
+    // contents so the caret stays visible while typing past the bottom edge;
+    // without it a long remark cannot be reached at all.
     g_hRemark = CreateWindowExW(0, L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP | ES_MULTILINE |
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE |
         ES_AUTOVSCROLL | ES_WANTRETURN | ES_NOHIDESEL,
         g_rcRemarkEdit.left, g_rcRemarkEdit.top,
         g_rcRemarkEdit.right - g_rcRemarkEdit.left,
@@ -522,7 +578,6 @@ static void CreateChildren(HWND hWnd)
         g_rcStatus.right - g_rcStatus.left, g_rcStatus.bottom - g_rcStatus.top,
         hWnd, (HMENU)IDC_STATUS, nullptr, nullptr);
 
-    if (g_hFile)   SendMessageW(g_hFile, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
     if (g_hRemark) SendMessageW(g_hRemark, WM_SETFONT, (WPARAM)g_fBody, TRUE);
     if (g_hStatus) SendMessageW(g_hStatus, WM_SETFONT, (WPARAM)g_fSmall, TRUE);
 
@@ -534,78 +589,23 @@ static void CreateChildren(HWND hWnd)
     }
 }
 
-// Ask the real path control how many lines it actually has vs how many it can
-// display, and grow it by the shortfall.
-//
-// ComputeLayout() has to measure BEFORE the window exists (the frame is sized to
-// the content), so it can only estimate: it counts characters per line with the
-// same font, but an EDIT control adds its own internal margin and rounds the
-// line count differently. Measuring the estimate against the real control and
-// correcting it is the only way to promise that the file name is never clipped,
-// for any path length and any DPI.
-static bool FitPathControl(HWND hWnd)
-{
-    if (!g_hFile) return false;
-
-    HDC hdc = GetDC(g_hFile);
-    const int lineH = hdc ? LineHeightPx(hdc, g_fSmall) : S(16);
-    if (hdc) ReleaseDC(g_hFile, hdc);
-
-    const int needed = (int)SendMessageW(g_hFile, EM_GETLINECOUNT, 0, 0);
-
-    RECT fr;
-    SendMessageW(g_hFile, EM_GETRECT, 0, (LPARAM)&fr);
-    const int have = fr.bottom - fr.top;
-
-    const int want = needed * lineH + S(4);
-    if (want <= have) return false;
-
-    g_pathPad += want - have;
-    ComputeLayout();
-
-    // Move the controls to the corrected geometry.
-    SetWindowPos(g_hFile, nullptr, g_rcPath.left, g_rcPath.top,
-                 g_rcPath.right - g_rcPath.left, g_rcPath.bottom - g_rcPath.top,
-                 SWP_NOZORDER | SWP_NOACTIVATE);
-    SetWindowPos(g_hRemark, nullptr, g_rcRemarkEdit.left, g_rcRemarkEdit.top,
-                 g_rcRemarkEdit.right - g_rcRemarkEdit.left,
-                 g_rcRemarkEdit.bottom - g_rcRemarkEdit.top,
-                 SWP_NOZORDER | SWP_NOACTIVATE);
-    SetWindowPos(g_hStatus, nullptr, g_rcStatus.left, g_rcStatus.top,
-                 g_rcStatus.right - g_rcStatus.left,
-                 g_rcStatus.bottom - g_rcStatus.top,
-                 SWP_NOZORDER | SWP_NOACTIVATE);
-
-    // Grow the window by the same amount so nothing gets cut off at the bottom.
-    RECT cr;
-    GetClientRect(hWnd, &cr);
-    if (g_clientH > cr.bottom)
-    {
-        RECT want2 = { 0, 0, cr.right, g_clientH };
-        AdjustWindowRectEx(&want2, kWindowStyle | WS_CLIPCHILDREN, FALSE,
-                           WS_EX_DLGMODALFRAME);
-        SetWindowPos(hWnd, nullptr, 0, 0, want2.right - want2.left,
-                     want2.bottom - want2.top,
-                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-    }
-    InvalidateRect(hWnd, nullptr, FALSE);
-    return true;
-}
-
 static void ApplyIcon(HWND hWnd)
 {
+    // Only the two title-bar sizes: the window no longer paints a logo itself.
     g_hIconBig = fr::logo::CreateLogoIcon(S(32));
     g_hIconSmall = fr::logo::CreateLogoIcon(S(16));
-    g_hIconPaint = fr::logo::CreateLogoIcon(S(22));
     if (g_hIconBig)   SendMessageW(hWnd, WM_SETICON, ICON_BIG, (LPARAM)g_hIconBig);
     if (g_hIconSmall) SendMessageW(hWnd, WM_SETICON, ICON_SMALL, (LPARAM)g_hIconSmall);
 }
 
 // --- painting --------------------------------------------------------------
-static void DrawCard(HDC hdc, const RECT& r, bool focused)
+// One surface, one hairline, no focus ring. The outline is 1px at every state:
+// the design keeps a single emphasis (the caret) instead of stacking a border
+// colour change on top of it.
+static void DrawCard(HDC hdc, const RECT& r)
 {
-    fr::theme::RoundedRect(hdc, r, S(10), fr::theme::kCard,
-        focused ? fr::theme::kAccent : fr::theme::kBorder, focused ? 2 : 1);
+    fr::theme::RoundedRect(hdc, r, S(8), fr::theme::Colors().card,
+        fr::theme::Colors().border, 1);
 }
 
 static void PaintAll(HWND hWnd, HDC hdc)
@@ -616,23 +616,24 @@ static void PaintAll(HWND hWnd, HDC hdc)
     FillRect(hdc, &client, g_brPage);
     SetBkMode(hdc, TRANSPARENT);
 
-    const bool remarkFocused = (GetFocus() == g_hRemark);
-    // Header card holds the logo and the file path; the remark card is the box
-    // the user types in. Neither carries a caption: the placeholder inside the
-    // remark box says what it is, and a path beside the logo needs no label.
-    DrawCard(hdc, g_rcHeaderCard, false);
-    DrawCard(hdc, g_rcRemarkCard, remarkFocused);
+    DrawCard(hdc, g_rcRemarkCard);
 
-    if (g_hIconPaint)
-        DrawIconEx(hdc, g_rcIcon.left, g_rcIcon.top, g_hIconPaint,
-                   g_rcIcon.right - g_rcIcon.left,
-                   g_rcIcon.bottom - g_rcIcon.top, 0, nullptr, DI_NORMAL);
+    // Footer: a failure on the left, the version on the right, both on the same
+    // baseline. Success is silent, so this row is normally just the version --
+    // and a failure never moves it.
+    const int baseline = g_rcStatus.top + S(18);
 
-    // Status text comes from the control so SetStatus() remains authoritative.
     WCHAR status[512] = { 0 };
     if (g_hStatus) GetWindowTextW(g_hStatus, status, 511);
-    fr::theme::Text(hdc, g_fSmall, fr::theme::kMuted, g_rcStatus, status,
-                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    if (status[0])
+        fr::theme::TextBaseline(hdc, g_fSmall,
+            g_statusError ? fr::theme::Colors().error : fr::theme::Colors().muted,
+            g_rcStatus.left, g_rcStatus.right - S(56), baseline, status,
+            DT_LEFT | DT_END_ELLIPSIS);
+
+    fr::theme::TextBaseline(hdc, g_fTiny, fr::theme::Colors().tertiary,
+        g_rcStatus.left, g_rcStatus.right, baseline,
+        L"v" FR_VERSION_TEXT, DT_RIGHT);
 }
 
 static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -645,16 +646,48 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         // the window existed, using the screen DPI, which can differ per monitor.
         CreateFonts();
         ComputeLayout();
-        g_brPage = CreateSolidBrush(fr::theme::kPage);
-        g_brCard = CreateSolidBrush(fr::theme::kCard);
+        fr::theme::SetDark(fr::theme::DetectSystemDark());
+        g_brPage = CreateSolidBrush(fr::theme::Colors().page);
+        g_brCard = CreateSolidBrush(fr::theme::Colors().card);
+        g_hMain = hWnd;
         ApplyIcon(hWnd);
         fr::theme::RoundWindow(hWnd);
+        fr::theme::ApplyTitleBarTheme(hWnd);
         CreateChildren(hWnd);
-        // Correct the pre-window estimate against the real control, so the path
-        // is guaranteed to be shown in full (possibly several passes, because
-        // growing the box can change the wrap).
-        for (int i = 0; i < 6 && FitPathControl(hWnd); ++i) {}
+        // The title bar carries the file name and nothing else. A native caption
+        // left-aligns whatever it is given, which is exactly the layout asked
+        // for, and it truncates an over-long name with an ellipsis by itself.
+        SetWindowTextW(hWnd, g_fileName.c_str());
         LoadRemark();
+        return 0;
+
+    case WM_TIMER:
+        if (wParam == kStatusTimer)
+        {
+            KillTimer(hWnd, kStatusTimer);
+            ClearStatus();
+        }
+        return 0;
+
+    case WM_SETTINGCHANGE:
+        // Windows broadcasts this when Settings > Personalization > Colors
+        // changes. Re-read the app mode and repaint only when it really flipped.
+        if (wParam == 0 && lParam &&
+            wcscmp((LPCWSTR)lParam, L"ImmersiveColorSet") == 0)
+        {
+            const bool wasDark = fr::theme::IsDark();
+            fr::theme::SetDark(fr::theme::DetectSystemDark());
+            if (fr::theme::IsDark() != wasDark)
+            {
+                fr::theme::ApplyTitleBarTheme(hWnd);
+                if (g_brPage) DeleteObject(g_brPage);
+                if (g_brCard) DeleteObject(g_brCard);
+                g_brPage = CreateSolidBrush(fr::theme::Colors().page);
+                g_brCard = CreateSolidBrush(fr::theme::Colors().card);
+                InvalidateRect(hWnd, nullptr, FALSE);
+                if (g_hRemark) InvalidateRect(g_hRemark, nullptr, TRUE);
+            }
+        }
         return 0;
 
     case WM_PAINT:
@@ -681,16 +714,41 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_ACTIVATE:
         // Focus left this window (another app was clicked, Alt+Tab, ...).
-        // Save only -- never close. The window stays exactly where it is.
+        // Save and, if the save went through, close: leaving the window is the
+        // user's way of saying "I'm done". A failed save keeps the window open
+        // with the reason in the status line, so nothing is silently lost.
         if (LOWORD(wParam) == WA_INACTIVE)
-            SaveIfChanged();
+        {
+            if (g_fBlurClosing) return 0;
+            // Our own windows (a message box, a file dialog, a child window) also
+            // deactivate us, and that is not the user leaving.
+            if (IsOwnWindow(GetForegroundWindow())) return 0;
+            g_fBlurClosing = true;
+            if (SaveIfChanged())
+                DestroyWindow(hWnd);
+            else
+                g_fBlurClosing = false;   // still here: let a later blur retry
+            return 0;
+        }
+        // Back in the foreground (the save failed, or the user returned): the
+        // next focus loss is a fresh decision and must be handled again.
+        if (LOWORD(wParam) == WA_ACTIVE) g_fBlurClosing = false;
         return 0;
 
     case WM_CLOSE:
-        // Closing always saves -- this is the only "button" the user needs.
-        SaveIfChanged();
+    {
+        // Esc = 取消: discard whatever was typed and close without touching the
+        // file. Everything else (the X button, Ctrl+Enter) saves first, and a
+        // failed save keeps the window open so its message can be read.
+        if (g_fDiscard)
+        {
+            DestroyWindow(hWnd);
+            return 0;
+        }
+        if (!SaveIfChanged()) return 0;
         DestroyWindow(hWnd);
         return 0;
+    }
 
     case WM_CTLCOLOREDIT:
     case WM_CTLCOLORSTATIC:
@@ -700,10 +758,10 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (child == g_hStatus)
         {
             SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, fr::theme::kMuted);
+            SetTextColor(hdc, g_statusError ? fr::theme::Colors().error
+                                            : fr::theme::Colors().muted);
             return (LRESULT)g_brPage;
         }
-        // Both edits sit on a white card; the read-only path is greyed out.
         //
         // The background mode MUST stay OPAQUE here. A multiline EDIT erases the
         // area it repaints by drawing text with this DC, so with TRANSPARENT the
@@ -711,15 +769,16 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         // characters keep their pixels on screen while being gone from the value
         // -- they can no longer be selected, but they are still visible.
         SetBkMode(hdc, OPAQUE);
-        SetBkColor(hdc, fr::theme::kCard);
-        SetTextColor(hdc, child == g_hFile ? fr::theme::kMuted : fr::theme::kText);
+        SetBkColor(hdc, fr::theme::Colors().card);
+        SetTextColor(hdc, fr::theme::Colors().text);
         return (LRESULT)g_brCard;
     }
 
     case WM_DESTROY:
         if (g_fBody)  DeleteObject(g_fBody);
         if (g_fSmall) DeleteObject(g_fSmall);
-        g_fBody = g_fSmall = nullptr;
+        if (g_fTiny)  DeleteObject(g_fTiny);
+        g_fBody = g_fSmall = g_fTiny = nullptr;
         if (g_brPage) DeleteObject(g_brPage);
         if (g_brCard) DeleteObject(g_brCard);
         g_brPage = g_brCard = nullptr;
@@ -727,6 +786,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (g_hIconSmall) DestroyIcon(g_hIconSmall);
         if (g_hIconPaint) DestroyIcon(g_hIconPaint);
         g_hIconBig = g_hIconSmall = g_hIconPaint = nullptr;
+        g_hMain = nullptr;
         PostQuitMessage(0);
         return 0;
     }
@@ -749,6 +809,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     }
     g_filePath = std::wstring(argv[1]);
     LocalFree(argv);
+
+    // The title bar shows the file name only. Everything up to the last
+    // separator is dropped: the full path is still what the remark is stored
+    // against, it just is not worth a line of screen space.
+    g_fileName = g_filePath;
+    const size_t sep = g_fileName.find_last_of(L"\\/");
+    if (sep != std::wstring::npos && sep + 1 < g_fileName.size())
+        g_fileName = g_fileName.substr(sep + 1);
 
     // Needed by the property-system calls in native_comment.h.
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -776,7 +844,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     AdjustWindowRectEx(&want, kWindowStyle, FALSE, WS_EX_DLGMODALFRAME);
 
     HWND hWnd = CreateWindowExW(WS_EX_DLGMODALFRAME, wc.lpszClassName,
-        L"备注",
+        g_fileName.c_str(),
         kWindowStyle | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, want.right - want.left, want.bottom - want.top,
         nullptr, nullptr, hInst, nullptr);

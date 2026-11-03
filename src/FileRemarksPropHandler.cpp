@@ -35,6 +35,7 @@
 #include "remark.h"
 #include "remark_io.h"
 #include "shell_columns.h"
+#include "ooxml_meta.h"
 
 // Shared definitions (must be extern "C" so the editor/test link against them).
 extern "C" const CLSID CLSID_FileRemarksPropHandler =
@@ -58,12 +59,11 @@ static bool RegGetSZ(HKEY hRoot, const WCHAR* subKey, const WCHAR* valueName,
                      WCHAR* out, DWORD cch);
 
 // ----- Diagnostics ---------------------------------------------------------
-// One line per process, written only when a handler is initialised through
-// IInitializeWithStream. It exists so a report of "the 备注 column is empty" can
-// be answered from a log file: the name Windows hands over decides whether the
-// remark (an alternate data stream) can be found at all.
-static bool g_streamNameLogged = false;
-
+// One line per initialisation, written to %TEMP%\FileRemarks_propdiag.log. It
+// exists so a report of "the 备注 column is empty" can be answered from a file
+// instead of guessed at: it shows which initialiser the shell chose and what
+// path arrived, and a remark (an alternate data stream) can only be found when
+// that path is the full one.
 static void DiagLog(const std::wstring& line)
 {
     WCHAR temp[MAX_PATH] = { 0 };
@@ -93,7 +93,6 @@ class CRemarkPropertyHandler
     : public IPropertyStore
     , public IInitializeWithItem
     , public IInitializeWithFile
-    , public IInitializeWithStream
     , public IPropertyStoreCapabilities
 {
 private:
@@ -111,6 +110,22 @@ private:
 
     // Set when a native value was edited through us, so Commit() forwards.
     bool m_fNativeDirty;
+
+    // OOXML packages (.docx/.pptx/.xlsx and siblings) are served by our own
+    // parser instead of delegated: Office's handler answers E_NOINTERFACE for
+    // IPropertyStore, and it cannot open a 0-byte or damaged package at all.
+    // Reading docProps/*.xml ourselves keeps every visible Details column while
+    // letting the ADS remark show up even for those files.
+    bool m_fOoxml;
+    bool m_fOoxmlLoaded;
+    fr::ooxml::Meta m_ooxml;
+
+    void EnsureOoxml()
+    {
+        if (m_fOoxmlLoaded) return;
+        m_fOoxmlLoaded = true;
+        if (m_szPath[0]) fr::ooxml::Read(m_szPath, &m_ooxml);
+    }
 
     // Creates and initialises the original handler named by `clsid` for the
     // current file. Failures are not fatal: we simply have nothing to forward.
@@ -148,8 +163,25 @@ private:
                     if (SUCCEEDED(SHCreateStreamOnFileEx(m_szPath, STGM_READ,
                         FILE_ATTRIBUTE_NORMAL, FALSE, nullptr, &strm)) && strm)
                     {
-                        hr = pStream->Initialize(strm, 0);
+                        // Two modes are tried because handlers disagree: most
+                        // image/audio handlers accept plain STGM_READ, while the
+                        // legacy OLE handler in propsys.dll requires the share
+                        // mode bit as well (measured on real .doc/.ppt/.xls:
+                        // STGM_READ -> STG_E_INVALIDFLAG, STGM_READ|SHARE_EXCLUSIVE
+                        // -> S_OK, 25+ keys and real values).
+                        hr = pStream->Initialize(strm, STGM_READ);
                         strm->Release();
+                        if (FAILED(hr))
+                        {
+                            strm = nullptr;
+                            if (SUCCEEDED(SHCreateStreamOnFileEx(m_szPath, STGM_READ,
+                                FILE_ATTRIBUTE_NORMAL, FALSE, nullptr, &strm)) && strm)
+                            {
+                                hr = pStream->Initialize(strm,
+                                    STGM_READ | STGM_SHARE_EXCLUSIVE);
+                                strm->Release();
+                            }
+                        }
                     }
                     pStream->Release();
                 }
@@ -173,6 +205,14 @@ private:
 
         const WCHAR* pdot = PathFindExtensionW(m_szPath);
         if (!pdot || !*pdot) return;
+
+        // OOXML packages are ours to describe: nothing to delegate to, because
+        // the Office handler exposes no IPropertyStore.
+        if (fr::ooxml::IsOoxmlExtension(pdot))
+        {
+            m_fOoxml = true;
+            return;
+        }
 
         WCHAR key[512];
         WCHAR szClsid[128];
@@ -222,10 +262,21 @@ private:
         return S_OK;
     }
 
+    static HRESULT SetString(PROPVARIANT* pv, const std::wstring& s)
+    {
+        size_t chars = s.size() + 1;
+        pv->vt = VT_LPWSTR;
+        pv->pwszVal = (PWSTR)CoTaskMemAlloc(chars * sizeof(WCHAR));
+        if (!pv->pwszVal) return E_OUTOFMEMORY;
+        StringCchCopyW(pv->pwszVal, chars, s.c_str());
+        return S_OK;
+    }
+
 public:
     CRemarkPropertyHandler()
         : m_cRef(1), m_psi(nullptr), m_fInit(false), m_fRead(false),
-          m_pNative(nullptr), m_fNativeDirty(false)
+          m_pNative(nullptr), m_fNativeDirty(false),
+          m_fOoxml(false), m_fOoxmlLoaded(false)
     {
         m_szPath[0] = 0;
         DllAddRef();
@@ -244,7 +295,6 @@ public:
             QITABENT(CRemarkPropertyHandler, IPropertyStore),
             QITABENT(CRemarkPropertyHandler, IInitializeWithItem),
             QITABENT(CRemarkPropertyHandler, IInitializeWithFile),
-            QITABENT(CRemarkPropertyHandler, IInitializeWithStream),
             QITABENT(CRemarkPropertyHandler, IPropertyStoreCapabilities),
             { 0 },
         };
@@ -272,6 +322,7 @@ public:
             CoTaskMemFree(psz);
         }
         m_fInit = true;
+        DiagLog(std::wstring(L"item init ") + m_szPath);
         FindNative();
         return S_OK;
     }
@@ -283,57 +334,7 @@ public:
         if (!pszFilePath) return E_INVALIDARG;
         StringCchCopyW(m_szPath, ARRAYSIZE(m_szPath), pszFilePath);
         m_fInit = true;
-        FindNative();
-        return S_OK;
-    }
-
-    // IInitializeWithStream
-    //
-    // Windows hands property handlers a stream instead of a path whenever it
-    // hosts them out of process (the surrogate exists so a buggy handler cannot
-    // take the shell down with it), and -- as measured on this machine -- it
-    // does exactly that for a handler registered under HKCU. Without this
-    // method the store cannot be created at all and the 备注 column comes up
-    // empty, so the stream is turned straight back into a path and everything
-    // downstream stays identical to the other two initialisers.
-    IFACEMETHODIMP Initialize(IStream* pStream, DWORD /*flags*/)
-    {
-        if (m_fInit) return HRESULT_FROM_WIN32(ERROR_ALREADY_INITIALIZED);
-        if (!pStream) return E_INVALIDARG;
-        STATSTG st = { 0 };
-        HRESULT hr = pStream->Stat(&st, STATFLAG_DEFAULT);
-        if (FAILED(hr)) return hr;
-        if (st.pwcsName)
-        {
-            // The stat name is not guaranteed to be a full path: the stream this
-            // process may be handed is built with CreateFile + the file name
-            // only. Log what actually arrives (once per process) so a machine
-            // that still shows an empty column can be diagnosed from the log
-            // instead of guessed at, then make the best of it.
-            if (!g_streamNameLogged)
-            {
-                g_streamNameLogged = true;
-                std::wstring line = L"stream init name=";
-                line += st.pwcsName;
-                line += L" relative=";
-                line += PathIsRelativeW(st.pwcsName) ? L"yes" : L"no";
-                DiagLog(line);
-            }
-            WCHAR full[MAX_PATH * 2] = { 0 };
-            if (!PathIsRelativeW(st.pwcsName) ||
-                GetFullPathNameW(st.pwcsName, ARRAYSIZE(full), full, nullptr))
-            {
-                StringCchCopyW(m_szPath, ARRAYSIZE(m_szPath),
-                               PathIsRelativeW(st.pwcsName) ? full : st.pwcsName);
-            }
-            else
-            {
-                StringCchCopyW(m_szPath, ARRAYSIZE(m_szPath), st.pwcsName);
-            }
-            CoTaskMemFree(st.pwcsName);
-            st.pwcsName = nullptr;
-        }
-        m_fInit = true;
+        DiagLog(std::wstring(L"file init ") + m_szPath);
         FindNative();
         return S_OK;
     }
@@ -360,6 +361,12 @@ public:
     IFACEMETHODIMP GetCount(DWORD* c)
     {
         if (!c) return E_INVALIDARG;
+        if (m_fOoxml)
+        {
+            EnsureOoxml();
+            *c = 1 + (DWORD)m_ooxml.values.size();
+            return S_OK;
+        }
         *c = 1;
         if (m_pNative)
         {
@@ -374,6 +381,19 @@ public:
     IFACEMETHODIMP GetAt(DWORD i, PROPERTYKEY* pkey)
     {
         if (!pkey) return E_INVALIDARG;
+        if (m_fOoxml)
+        {
+            EnsureOoxml();
+            // Index 0 is always the remark, so the column works even when the
+            // package could not be parsed at all.
+            if (i == 0) { *pkey = PKEY_FileRemark; return S_OK; }
+            if (i - 1 < (DWORD)m_ooxml.values.size())
+            {
+                *pkey = m_ooxml.values[i - 1].key;
+                return S_OK;
+            }
+            return E_INVALIDARG;
+        }
         // With no native store the remark is all we have, so it is ours; with
         // one, it is ours only when the native side does not list it too.
         bool own = !m_pNative || !NativeHasComment();
@@ -388,6 +408,27 @@ public:
     {
         if (!pv) return E_INVALIDARG;
         PropVariantInit(pv);
+        if (m_fOoxml)
+        {
+            if (key == PKEY_FileRemark)
+            {
+                // The ADS remark wins; dc:description is only the fallback,
+                // exactly like Office's handler reports it.
+                if (!m_fRead) ReadRemark();
+                if (!m_remark.empty()) return SetString(pv, m_remark);
+                EnsureOoxml();
+                if (!m_ooxml.description.empty())
+                    return SetString(pv, m_ooxml.description);
+                return S_OK;
+            }
+            EnsureOoxml();
+            for (size_t i = 0; i < m_ooxml.values.size(); ++i)
+            {
+                if (m_ooxml.values[i].key == key)
+                    return PropVariantCopy(pv, &m_ooxml.values[i].var);
+            }
+            return S_OK;
+        }
         if (key != PKEY_FileRemark)
             return m_pNative ? m_pNative->GetValue(key, pv) : S_OK;
         if (!m_fRead) ReadRemark();
@@ -405,6 +446,12 @@ public:
     }
     IFACEMETHODIMP SetValue(REFPROPERTYKEY key, REFPROPVARIANT propvar)
     {
+        // OOXML packages: only the remark is writable. Writing title/author back
+        // would mean rewriting the ZIP package of a file Office may have open,
+        // which is not something a property handler should risk; those columns
+        // stay read-only in the Details pane instead.
+        if (m_fOoxml && key != PKEY_FileRemark)
+            return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
         // Every key the original handler knows is still editable through us, so
         // taking the slot over does not make any native column read-only.
         if (key != PKEY_FileRemark && m_pNative)
@@ -439,6 +486,7 @@ public:
     IFACEMETHODIMP IsPropertyWritable(REFPROPERTYKEY key)
     {
         if (key == PKEY_FileRemark) return S_OK;
+        if (m_fOoxml) return S_FALSE;
         if (m_pNative)
         {
             IPropertyStoreCapabilities* pNativeCap = nullptr;
@@ -497,6 +545,37 @@ public:
 };
 
 // ----- Registry helpers ---------------------------------------------------
+//
+// Every write goes to the user's hive AND, when the process happens to be
+// elevated, to the machine hive as well. Property-handler associations are NOT
+// an HKCU-first lookup: measured on a real machine, a type that already has a
+// machine-wide handler (jpg, png, mp3, exe, ...) keeps using it even when HKCU
+// names another CLSID, so an HKCU-only registration is silently ignored for
+// exactly the types whose native handler exists -- and for .exe that native
+// handler then fails with 0x80070715 (ERROR_RESOURCE_TYPE_NOT_FOUND) and the
+// 备注 column comes up empty. Writing both hives makes the column work whether
+// or not the installer got a token; the HKCU copy still carries the types that
+// have no machine-wide handler at all.
+static void RegDeleteSZUser(const WCHAR* subKey, const WCHAR* valueName)
+{
+    HKEY hk = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, subKey, 0, KEY_SET_VALUE, &hk) == ERROR_SUCCESS)
+    {
+        RegDeleteValueW(hk, valueName);
+        RegCloseKey(hk);
+    }
+}
+
+static void RegDeleteDWORDUser(const WCHAR* subKey, const WCHAR* valueName)
+{
+    HKEY hk = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, subKey, 0, KEY_SET_VALUE, &hk) == ERROR_SUCCESS)
+    {
+        RegDeleteValueW(hk, valueName);
+        RegCloseKey(hk);
+    }
+}
+
 static HRESULT RegSetSZ(HKEY hRoot, const WCHAR* subKey, const WCHAR* valueName, const WCHAR* data)
 {
     HKEY hk = nullptr;
@@ -509,6 +588,8 @@ static HRESULT RegSetSZ(HKEY hRoot, const WCHAR* subKey, const WCHAR* valueName,
             (const BYTE*)data, (DWORD)((wcslen(data) + 1) * sizeof(WCHAR))));
         RegCloseKey(hk);
     }
+    if (hRoot == HKEY_LOCAL_MACHINE)
+        RegDeleteSZUser(subKey, valueName);
     return hr;
 }
 
@@ -524,7 +605,26 @@ static HRESULT RegSetDWORD(HKEY hRoot, const WCHAR* subKey, const WCHAR* valueNa
             (const BYTE*)&data, sizeof(data)));
         RegCloseKey(hk);
     }
+    if (hRoot == HKEY_LOCAL_MACHINE)
+        RegDeleteDWORDUser(subKey, valueName);
     return hr;
+}
+
+// Deleting mirrors the same way: whatever we wrote machine-wide has to go too,
+// otherwise uninstalling would leave HKLM pointing at a deleted DLL (which shows
+// up as 0x8007007E, indistinguishable from a missing value).
+// Deleting removes the entry from BOTH hives: an uninstall has to leave nothing
+// behind, and every build so far has written to one or the other.
+static void RegDeleteKeyBoth(HKEY hRoot, const WCHAR* subKey)
+{
+    RegDeleteKeyW(hRoot, subKey);
+    RegDeleteKeyW(hRoot == HKEY_LOCAL_MACHINE ? HKEY_CURRENT_USER : HKEY_LOCAL_MACHINE, subKey);
+}
+
+static void RegDeleteTreeBoth(HKEY hRoot, const WCHAR* subKey)
+{
+    RegDeleteTreeW(hRoot, subKey);
+    RegDeleteTreeW(hRoot == HKEY_LOCAL_MACHINE ? HKEY_CURRENT_USER : HKEY_LOCAL_MACHINE, subKey);
 }
 
 // Returns true when the string value equals `expected` (case-insensitive).
@@ -560,6 +660,21 @@ static bool RegGetSZ(HKEY hRoot, const WCHAR* subKey, const WCHAR* valueName,
     if (rc != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ))
         return false;
     out[cch - 1] = 0;
+    return true;
+}
+
+// Reads a DWORD value; returns false when absent or not a DWORD.
+static bool RegGetDWORD(HKEY hRoot, const WCHAR* subKey, const WCHAR* valueName, DWORD* out)
+{
+    if (!out) return false;
+    HKEY hk = nullptr;
+    if (RegOpenKeyExW(hRoot, subKey, 0, KEY_READ, &hk) != ERROR_SUCCESS)
+        return false;
+    DWORD data = 0, cb = sizeof(data), type = 0;
+    LONG rc = RegQueryValueExW(hk, valueName, nullptr, &type, (BYTE*)&data, &cb);
+    RegCloseKey(hk);
+    if (rc != ERROR_SUCCESS || type != REG_DWORD) return false;
+    *out = data;
     return true;
 }
 
@@ -638,17 +753,17 @@ static bool ReadHandlerCLSID(const WCHAR* ext, WCHAR* out, DWORD cch)
     WCHAR key[512];
     StringCchPrintfW(key, ARRAYSIZE(key),
         L"Software\\Microsoft\\Windows\\CurrentVersion\\PropertySystem\\PropertyHandlers\\%s", ext);
-    if (RegGetSZ(HKEY_CURRENT_USER, key, nullptr, out, cch)) return true;
+    if (RegGetSZ(HKEY_LOCAL_MACHINE, key, nullptr, out, cch)) return true;
     if (RegGetSZ(HKEY_LOCAL_MACHINE, key, nullptr, out, cch)) return true;
 
     StringCchPrintfW(key, ARRAYSIZE(key),
         L"Software\\Classes\\%s\\ShellEx\\PropertyHandler", ext);
-    if (RegGetSZ(HKEY_CURRENT_USER, key, nullptr, out, cch)) return true;
+    if (RegGetSZ(HKEY_LOCAL_MACHINE, key, nullptr, out, cch)) return true;
     if (RegGetSZ(HKEY_LOCAL_MACHINE, key, nullptr, out, cch)) return true;
 
     // The third shape stores the CLSID as a value named after the extension.
     const WCHAR* kSys = L"Software\\Microsoft\\Windows\\CurrentVersion\\PropertySystem\\SystemPropertyHandlers";
-    if (RegGetSZ(HKEY_CURRENT_USER, kSys, ext, out, cch)) return true;
+    if (RegGetSZ(HKEY_LOCAL_MACHINE, kSys, ext, out, cch)) return true;
     return RegGetSZ(HKEY_LOCAL_MACHINE, kSys, ext, out, cch);
 }
 
@@ -658,35 +773,49 @@ static bool SystemOwnsHandler(const WCHAR* ext)
     return ReadHandlerCLSID(ext, sz, ARRAYSIZE(sz));
 }
 
-// Types Windows already has a property handler for, but whose handler exposes a
-// plain IPropertyStore and can therefore be WRAPPED instead of replaced: our
-// handler keeps every native value and only appends the "备注" key. This was
-// measured with tools/test_chain_matrix.py on real files -- images/audio/video
-// handlers initialise from a stream and exe/dll/sys from a file name, and all of
-// them answer QueryInterface(IPropertyStore).
+// Types Windows already has a property handler for, but where the slot has to
+// be taken over: our handler keeps every native value and only appends the
+// "备注" key. This was measured with tools/test_chain_matrix.py on real files --
+// images/audio/video handlers initialise from a stream and exe/dll/sys from a
+// file name, and all of them answer QueryInterface(IPropertyStore).
 //
-// Deliberately absent: .doc/.docx/.xls/.xlsx/.ppt/.pptx. The Office metadata
-// handlers do not expose IPropertyStore, so taking their slot would hide the
-// native Details columns -- those types keep their system handler and use only
-// the right-click editor.
+// .doc/.ppt/.xls (the legacy OLE formats) belong here too, and that was measured
+// on real Word/PowerPoint/Excel 97-2003 files: their handler is
+// {97e467b4-98c6-4f19-9588-161b7773d6f6} in propsys.dll, which DOES answer
+// IPropertyStore (25-26 keys), and it initialises from a stream --
+// SHCreateStreamOnFileEx(...) + IInitializeWithStream::Initialize with
+// STGM_READ|STGM_SHARE_EXCLUSIVE. Wrapping them means an ADS-only remark is
+// visible in the column even when the file itself cannot take metadata (0 bytes,
+// damaged, locked by Office), while 作者/标题/页数 keep coming from delegation.
+//
+// The OOXML formats (.docx/.pptx/.xlsx and siblings) are the opposite case:
+// their Office handlers ({5985FC23-...}, {01BE4CFB-...}, {33154C99-...}) do not
+// answer IPropertyStore even after IInitializeWithStream::Initialize, so there
+// is nothing to delegate to. They are taken over anyway, because Office's
+// handler cannot open a 0-byte "新建" placeholder (0x80030050) and the 备注
+// column then stays empty forever. Our own reader parses docProps/core.xml and
+// docProps/app.xml instead (see ooxml_meta.h), which reproduces every visible
+// Details column -- 作者/标题/页数/字数/创建时间/... -- while still returning
+// the ADS remark for packages that cannot be opened at all.
 static const WCHAR* const kChainExts[] = {
     L".exe", L".dll", L".sys", L".ocx", L".cpl", L".scr",
     L".png", L".jpg", L".jpeg", L".jfif", L".gif", L".bmp", L".ico",
     L".tif", L".tiff", L".webp", L".dib", L".cur", L".ani", L".wmf", L".emf",
     L".mp3", L".mp4", L".m4a", L".wav", L".wma", L".avi", L".wmv",
     L".mov", L".mkv", L".flac", L".ogg", L".aac",
+    L".doc", L".ppt", L".xls",
+    L".docx", L".docm", L".dotx", L".dotm",
+    L".xlsx", L".xlsm", L".xlsb", L".xltx", L".xltm",
+    L".pptx", L".pptm", L".potx", L".potm",
     nullptr
 };
 
-// Types we must NOT wrap (see kChainExts) but which the wildcard fallback could
-// still capture. To keep their own Details columns we PIN them: the handler they
-// use today is written into the per-extension class key, so the specific entry
-// always answers before the wildcard. The value written is the CLSID Windows was
-// already using, so nothing about these types changes.
+// Types we do NOT take over but which the wildcard fallback could still capture.
+// To keep their own Details columns we PIN them: the handler they use today is
+// written into the per-extension class key, so the specific entry always answers
+// before the wildcard. The value written is the CLSID Windows was already using,
+// so nothing about these types changes.
 static const WCHAR* const kPinExts[] = {
-    L".doc", L".docx", L".docm", L".dotx", L".dotm",
-    L".xls", L".xlsx", L".xlsm", L".xlsb", L".xltx", L".xltm",
-    L".ppt", L".pptx", L".pptm", L".potx", L".potm",
     L".vsd", L".vsdx", L".accdt",
     // These get their handler from PropertySystem\SystemPropertyHandlers only,
     // so a wildcard association could otherwise take them over.
@@ -705,7 +834,7 @@ static void SaveOriginalHandler(const WCHAR* ext)
 
     WCHAR key[512];
     StringCchPrintfW(key, ARRAYSIZE(key), L"Software\\FileRemarks\\Original\\%s", ext);
-    RegSetSZ(HKEY_CURRENT_USER, key, nullptr, szOrig);
+    RegSetSZ(HKEY_LOCAL_MACHINE, key, nullptr, szOrig);
 }
 
 // Raises the resolution priority of the handler `ext` already uses by writing it
@@ -720,19 +849,27 @@ static void PinOneExtension(const WCHAR* ext)
 {
     if (!ext || ext[0] != L'.') return;
 
+    // The per-extension key wins over PropertySystem, so when it already exists
+    // it holds the handler that is really in effect; keep exactly that value.
+    // Recording HadKey lets uninstall leave a third-party key alone instead of
+    // deleting something it did not create.
+    WCHAR keyEx[512];
+    StringCchPrintfW(keyEx, ARRAYSIZE(keyEx),
+        L"Software\\Classes\\%s\\ShellEx\\PropertyHandler", ext);
+
     WCHAR szPin[128] = { 0 };
-    if (!ReadHandlerCLSID(ext, szPin, ARRAYSIZE(szPin))) return;
+    const bool hadKey = RegGetSZ(HKEY_LOCAL_MACHINE, keyEx, nullptr, szPin, ARRAYSIZE(szPin));
+    if (!hadKey && !ReadHandlerCLSID(ext, szPin, ARRAYSIZE(szPin))) return;
     if (CompareStringOrdinal(szPin, -1, SZ_CLSID, -1, TRUE) == CSTR_EQUAL) return;
 
     WCHAR key[512];
-    StringCchPrintfW(key, ARRAYSIZE(key),
-        L"Software\\Classes\\%s\\ShellEx\\PropertyHandler", ext);
-    RegSetSZ(HKEY_CURRENT_USER, key, nullptr, szPin);
+    RegSetSZ(HKEY_LOCAL_MACHINE, keyEx, nullptr, szPin);
 
     // Remember what we wrote so uninstall can take the key back out again, but
     // only while it still holds our value (see DllUnregisterServer).
     StringCchPrintfW(key, ARRAYSIZE(key), L"Software\\FileRemarks\\Pinned\\%s", ext);
-    RegSetSZ(HKEY_CURRENT_USER, key, nullptr, szPin);
+    RegSetSZ(HKEY_LOCAL_MACHINE, key, nullptr, szPin);
+    RegSetDWORD(HKEY_LOCAL_MACHINE, key, L"HadKey", hadKey ? 1u : 0u);
 }
 
 // Pins the handler of every file type on this machine that has one, whichever of
@@ -748,7 +885,7 @@ static void PinAllExistingHandlers()
     // Both roots are enumerated: a per-user install writes everything under HKCU,
     // while the handlers Windows ships for a type live in HKLM. Reading HKLM does
     // not need an elevated token.
-    static HKEY const kRoots[2] = { HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE };
+    static HKEY const kRoots[2] = { HKEY_LOCAL_MACHINE, HKEY_LOCAL_MACHINE };
 
     for (int r = 0; r < 2; ++r)
     {
@@ -818,23 +955,23 @@ STDAPI __declspec(dllexport) DllRegisterServer()
     // 1) CLSID registration (documented shape).
     WCHAR keyCls[MAX_PATH];
     StringCchPrintfW(keyCls, ARRAYSIZE(keyCls), L"Software\\Classes\\CLSID\\%s", SZ_CLSID);
-    HRESULT hr = RegSetSZ(HKEY_CURRENT_USER, keyCls, nullptr, L"FileRemarks Property Handler");
+    HRESULT hr = RegSetSZ(HKEY_LOCAL_MACHINE, keyCls, nullptr, L"FileRemarks Property Handler");
     if (FAILED(hr)) return hr;
 
     // We do not implement IInitializeWithStream, so the shell must keep us out
     // of the isolated surrogate host.
-    hr = RegSetDWORD(HKEY_CURRENT_USER, keyCls, L"DisableProcessIsolation", 1);
+    hr = RegSetDWORD(HKEY_LOCAL_MACHINE, keyCls, L"DisableProcessIsolation", 1);
     if (FAILED(hr)) return hr;
     // Commit() is the only write path; the shell need not wrap us in a
     // transaction.
-    hr = RegSetDWORD(HKEY_CURRENT_USER, keyCls, L"ManualSafeSave", 1);
+    hr = RegSetDWORD(HKEY_LOCAL_MACHINE, keyCls, L"ManualSafeSave", 1);
     if (FAILED(hr)) return hr;
 
     WCHAR keyInproc[MAX_PATH];
     StringCchPrintfW(keyInproc, ARRAYSIZE(keyInproc), L"Software\\Classes\\CLSID\\%s\\InprocServer32", SZ_CLSID);
-    hr = RegSetSZ(HKEY_CURRENT_USER, keyInproc, nullptr, dllPath);
+    hr = RegSetSZ(HKEY_LOCAL_MACHINE, keyInproc, nullptr, dllPath);
     if (FAILED(hr)) return hr;
-    hr = RegSetSZ(HKEY_CURRENT_USER, keyInproc, L"ThreadingModel", L"Both");
+    hr = RegSetSZ(HKEY_LOCAL_MACHINE, keyInproc, L"ThreadingModel", L"Both");
     if (FAILED(hr)) return hr;
 
     // 2) No property schema is registered: the value is published under
@@ -851,11 +988,11 @@ STDAPI __declspec(dllexport) DllRegisterServer()
 
         StringCchPrintfW(keyInproc, ARRAYSIZE(keyInproc),
             L"Software\\Classes\\%s\\ShellEx\\PropertyHandler", ext);
-        HRESULT h1 = RegSetSZ(HKEY_CURRENT_USER, keyInproc, nullptr, SZ_CLSID);
+        HRESULT h1 = RegSetSZ(HKEY_LOCAL_MACHINE, keyInproc, nullptr, SZ_CLSID);
 
         StringCchPrintfW(keyInproc, ARRAYSIZE(keyInproc),
             L"Software\\Microsoft\\Windows\\CurrentVersion\\PropertySystem\\PropertyHandlers\\%s", ext);
-        HRESULT h2 = RegSetSZ(HKEY_CURRENT_USER, keyInproc, nullptr, SZ_CLSID);
+        HRESULT h2 = RegSetSZ(HKEY_LOCAL_MACHINE, keyInproc, nullptr, SZ_CLSID);
 
         if (SUCCEEDED(h1) && FAILED(h2)) h1 = h2;
         if (FAILED(h1) && SUCCEEDED(hrFirstFail)) hrFirstFail = h1;
@@ -871,11 +1008,11 @@ STDAPI __declspec(dllexport) DllRegisterServer()
 
         StringCchPrintfW(keyInproc, ARRAYSIZE(keyInproc),
             L"Software\\Classes\\%s\\ShellEx\\PropertyHandler", ext);
-        HRESULT h1 = RegSetSZ(HKEY_CURRENT_USER, keyInproc, nullptr, SZ_CLSID);
+        HRESULT h1 = RegSetSZ(HKEY_LOCAL_MACHINE, keyInproc, nullptr, SZ_CLSID);
 
         StringCchPrintfW(keyInproc, ARRAYSIZE(keyInproc),
             L"Software\\Microsoft\\Windows\\CurrentVersion\\PropertySystem\\PropertyHandlers\\%s", ext);
-        HRESULT h2 = RegSetSZ(HKEY_CURRENT_USER, keyInproc, nullptr, SZ_CLSID);
+        HRESULT h2 = RegSetSZ(HKEY_LOCAL_MACHINE, keyInproc, nullptr, SZ_CLSID);
 
         if (SUCCEEDED(h1) && FAILED(h2)) h1 = h2;
         if (FAILED(h1) && SUCCEEDED(hrFirstFail)) hrFirstFail = h1;
@@ -899,7 +1036,17 @@ STDAPI __declspec(dllexport) DllRegisterServer()
     //    get the 备注 column. This is additive: a per-extension association
     //    always takes precedence, so every type handled in steps 3-5 keeps the
     //    handler chosen there, and Office keeps the system handler it had.
-    hr = RegSetSZ(HKEY_CURRENT_USER, L"Software\\Classes\\*\\shellex\\PropertyHandler",
+    // Save whatever the wildcard held before, so uninstall can put it back
+    // instead of deleting a key some other shell extension registered.
+    {
+        WCHAR szPrev[128] = { 0 };
+        if (RegGetSZ(HKEY_LOCAL_MACHINE, L"Software\\Classes\\*\\shellex\\PropertyHandler",
+                     nullptr, szPrev, ARRAYSIZE(szPrev)))
+            RegSetSZ(HKEY_LOCAL_MACHINE, L"Software\\FileRemarks\\Original\\Wildcard",
+                     nullptr, szPrev);
+    }
+
+    hr = RegSetSZ(HKEY_LOCAL_MACHINE, L"Software\\Classes\\*\\shellex\\PropertyHandler",
                   nullptr, SZ_CLSID);
     if (FAILED(hr) && SUCCEEDED(hrFirstFail)) hrFirstFail = hr;
 
@@ -909,6 +1056,14 @@ STDAPI __declspec(dllexport) DllRegisterServer()
     //    restores it exactly. A failure here is not fatal: the extension still
     //    works, the user would just add the column manually.
     fr::columns::EnableCommentColumn();
+
+    // Anything the per-user builds (v1.9 - v1.15) wrote into HKCU is removed
+    // here: two registrations naming different DLLs is exactly the state that
+    // made the column go blank, and a stale one must never survive an upgrade.
+    RegDeleteTreeW(HKEY_CURRENT_USER, keyCls);
+    RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\FileRemarks");
+    RegDeleteTreeW(HKEY_CURRENT_USER,
+                   L"Software\\Classes\\*\\shellex\\PropertyHandler");
 
     return hrFirstFail;
 }
@@ -927,13 +1082,13 @@ STDAPI __declspec(dllexport) DllUnregisterServer()
     {
         StringCchPrintfW(key, ARRAYSIZE(key),
             L"Software\\Classes\\%s\\ShellEx\\PropertyHandler", kCandidateExts[i]);
-        if (RegSZEquals(HKEY_CURRENT_USER, key, nullptr, SZ_CLSID))
-            RegDeleteKeyW(HKEY_CURRENT_USER, key);
+        if (RegSZEquals(HKEY_LOCAL_MACHINE, key, nullptr, SZ_CLSID))
+            RegDeleteKeyBoth(HKEY_LOCAL_MACHINE, key);
 
         StringCchPrintfW(key, ARRAYSIZE(key),
             L"Software\\Microsoft\\Windows\\CurrentVersion\\PropertySystem\\PropertyHandlers\\%s", kCandidateExts[i]);
-        if (RegSZEquals(HKEY_CURRENT_USER, key, nullptr, SZ_CLSID))
-            RegDeleteKeyW(HKEY_CURRENT_USER, key);
+        if (RegSZEquals(HKEY_LOCAL_MACHINE, key, nullptr, SZ_CLSID))
+            RegDeleteKeyBoth(HKEY_LOCAL_MACHINE, key);
     }
 
     // Types we wrapped: put the handler Windows had before back in place, so the
@@ -944,32 +1099,32 @@ STDAPI __declspec(dllexport) DllUnregisterServer()
 
         StringCchPrintfW(key, ARRAYSIZE(key), L"Software\\FileRemarks\\Original\\%s", ext);
         WCHAR szOrig[128] = { 0 };
-        bool haveOrig = RegGetSZ(HKEY_CURRENT_USER, key, nullptr, szOrig, ARRAYSIZE(szOrig));
+        bool haveOrig = RegGetSZ(HKEY_LOCAL_MACHINE, key, nullptr, szOrig, ARRAYSIZE(szOrig));
 
         WCHAR keyEx[512];
         StringCchPrintfW(keyEx, ARRAYSIZE(keyEx),
             L"Software\\Classes\\%s\\ShellEx\\PropertyHandler", ext);
-        if (RegSZEquals(HKEY_CURRENT_USER, keyEx, nullptr, SZ_CLSID))
+        if (RegSZEquals(HKEY_LOCAL_MACHINE, keyEx, nullptr, SZ_CLSID))
         {
             if (haveOrig)
-                RegSetSZ(HKEY_CURRENT_USER, keyEx, nullptr, szOrig);
+                RegSetSZ(HKEY_LOCAL_MACHINE, keyEx, nullptr, szOrig);
             else
-                RegDeleteKeyW(HKEY_CURRENT_USER, keyEx);
+                RegDeleteKeyBoth(HKEY_LOCAL_MACHINE, keyEx);
         }
 
         StringCchPrintfW(keyEx, ARRAYSIZE(keyEx),
             L"Software\\Microsoft\\Windows\\CurrentVersion\\PropertySystem\\PropertyHandlers\\%s", ext);
-        if (RegSZEquals(HKEY_CURRENT_USER, keyEx, nullptr, SZ_CLSID))
+        if (RegSZEquals(HKEY_LOCAL_MACHINE, keyEx, nullptr, SZ_CLSID))
         {
             if (haveOrig)
-                RegSetSZ(HKEY_CURRENT_USER, keyEx, nullptr, szOrig);
+                RegSetSZ(HKEY_LOCAL_MACHINE, keyEx, nullptr, szOrig);
             else
-                RegDeleteKeyW(HKEY_CURRENT_USER, keyEx);
+                RegDeleteKeyBoth(HKEY_LOCAL_MACHINE, keyEx);
         }
 
-        RegDeleteKeyW(HKEY_CURRENT_USER, key);
+        RegDeleteKeyBoth(HKEY_LOCAL_MACHINE, key);
     }
-    RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\FileRemarks\\Original");
+    RegDeleteTreeBoth(HKEY_LOCAL_MACHINE, L"Software\\FileRemarks\\Original");
 
     // Undo the pinning from step 5 of registration. The pinned keys are read
     // back from our own bookkeeping rather than from a hard-coded list, because
@@ -979,7 +1134,7 @@ STDAPI __declspec(dllexport) DllUnregisterServer()
     WCHAR keyPinned[512];
     StringCchPrintfW(keyPinned, ARRAYSIZE(keyPinned), L"Software\\FileRemarks\\Pinned");
     HKEY hkPinned = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, keyPinned, 0, KEY_READ, &hkPinned) == ERROR_SUCCESS)
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, keyPinned, 0, KEY_READ, &hkPinned) == ERROR_SUCCESS)
     {
         WCHAR name[256];
         for (DWORD i = 0; ; ++i)
@@ -991,31 +1146,44 @@ STDAPI __declspec(dllexport) DllUnregisterServer()
             WCHAR keyPin[512];
             StringCchPrintfW(keyPin, ARRAYSIZE(keyPin), L"Software\\FileRemarks\\Pinned\\%s", name);
             WCHAR szPin[128] = { 0 };
-            bool havePin = RegGetSZ(HKEY_CURRENT_USER, keyPin, nullptr, szPin, ARRAYSIZE(szPin));
+            bool havePin = RegGetSZ(HKEY_LOCAL_MACHINE, keyPin, nullptr, szPin, ARRAYSIZE(szPin));
+            DWORD hadKey = 0;
+            RegGetDWORD(HKEY_LOCAL_MACHINE, keyPin, L"HadKey", &hadKey);
 
             WCHAR keyEx[512];
             StringCchPrintfW(keyEx, ARRAYSIZE(keyEx),
                 L"Software\\Classes\\%s\\ShellEx\\PropertyHandler", name);
             // Only delete while the key still holds the value we pinned; if
             // Office or the OS rewrote it in the meantime, leave their value.
-            if (havePin && RegSZEquals(HKEY_CURRENT_USER, keyEx, nullptr, szPin))
-                RegDeleteKeyW(HKEY_CURRENT_USER, keyEx);
+            // HadKey=1 means the key existed before we pinned it (a third-party
+            // registration): leave it in place, it already holds its own value.
+            if (havePin && hadKey == 0 && RegSZEquals(HKEY_LOCAL_MACHINE, keyEx, nullptr, szPin))
+                RegDeleteKeyBoth(HKEY_LOCAL_MACHINE, keyEx);
         }
         RegCloseKey(hkPinned);
     }
-    RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\FileRemarks");
 
-    // The wildcard fallback from step 6 of registration. Only removed when it
-    // still points at us.
+    // The wildcard fallback from step 6 of registration: put back what was there
+    // before us, or remove it when we created it. Read the saved value first --
+    // the bookkeeping tree is deleted right afterwards.
     WCHAR keyStar[MAX_PATH];
     StringCchPrintfW(keyStar, ARRAYSIZE(keyStar),
         L"Software\\Classes\\*\\shellex\\PropertyHandler");
-    if (RegSZEquals(HKEY_CURRENT_USER, keyStar, nullptr, SZ_CLSID))
-        RegDeleteKeyW(HKEY_CURRENT_USER, keyStar);
+    if (RegSZEquals(HKEY_LOCAL_MACHINE, keyStar, nullptr, SZ_CLSID))
+    {
+        WCHAR szPrev[128] = { 0 };
+        if (RegGetSZ(HKEY_LOCAL_MACHINE, L"Software\\FileRemarks\\Original\\Wildcard",
+                     nullptr, szPrev, ARRAYSIZE(szPrev)))
+            RegSetSZ(HKEY_LOCAL_MACHINE, keyStar, nullptr, szPrev);
+        else
+            RegDeleteKeyBoth(HKEY_LOCAL_MACHINE, keyStar);
+    }
+
+    RegDeleteTreeBoth(HKEY_LOCAL_MACHINE, L"Software\\FileRemarks");
 
     WCHAR keyCls[MAX_PATH];
     StringCchPrintfW(keyCls, ARRAYSIZE(keyCls), L"Software\\Classes\\CLSID\\%s", SZ_CLSID);
-    RegDeleteTreeW(HKEY_CURRENT_USER, keyCls);
+    RegDeleteTreeBoth(HKEY_LOCAL_MACHINE, keyCls);
 
     return S_OK;
 }

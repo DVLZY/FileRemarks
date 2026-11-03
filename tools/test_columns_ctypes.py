@@ -133,6 +133,25 @@ def main():
     check(rc8 == 0 and out8 == "",
           "a whitespace-only list is refused instead of patched")
 
+    print("\n=== uninstall repairs the machine default an old release wrote ===")
+    lib.FrTestStripComment.argtypes = [ctypes.c_wchar_p, WCHARP, ctypes.c_int]
+    lib.FrTestStripComment.restype = ctypes.c_int
+
+    def strip(src):
+        buf.value = ""
+        return lib.FrTestStripComment(src, ctypes.cast(buf, WCHARP), 4096), buf.value
+
+    polluted = GENERIC + ";0System.Comment"
+    rc9, out9 = strip(polluted)
+    check(rc9 == 1, "the token is detected in a machine value")
+    check(out9 == GENERIC,
+          "the rest of the machine value is preserved exactly (got %r)" % out9[:60])
+    rc10, out10 = strip(polluted.replace(";0System.Comment", ";0System.Comment;0System.Size"))
+    check(rc10 == 1 and "System.Comment" not in out10,
+          "a token that is not last is removed without leaving a broken list")
+    rc11, _ = strip(GENERIC)
+    check(rc11 == 0, "a value we never touched is left alone")
+
     print("")
     if failures:
         print("FAILURES:")

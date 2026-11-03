@@ -170,6 +170,11 @@ def main():
     print("Commit(clear) hr=0x%08X" % (hr & 0xFFFFFFFF))
     exists = os.path.exists(ads)
     print("ADS exists after clear:", exists)
+    if exists:
+        try:
+            print("  leftover:", repr(open(ads, "rb").read()))
+        except OSError as exc:
+            print("  leftover unreadable:", exc)
     assert not exists, "ADS should be deleted"
 
     release(ps)

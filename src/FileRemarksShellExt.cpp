@@ -307,6 +307,21 @@ STDAPI __declspec(dllexport) DllCanUnloadNow()
 }
 
 // Registry helpers.
+//
+// The association is written to the user's hive and, when this process happens
+// to be elevated, to the machine hive too. Shell associations are looked up with
+// HKCU first, but the property handler this DLL is installed next to is not, so
+// writing both keeps the two halves of the product in the same place.
+static void RegDeleteSZUser(const WCHAR* subKey, const WCHAR* valueName)
+{
+    HKEY hk = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, subKey, 0, KEY_SET_VALUE, &hk) == ERROR_SUCCESS)
+    {
+        RegDeleteValueW(hk, valueName);
+        RegCloseKey(hk);
+    }
+}
+
 static HRESULT RegSetSZ(HKEY hRoot, const WCHAR* subKey, const WCHAR* valueName, const WCHAR* data)
 {
     HKEY hk = nullptr;
@@ -319,7 +334,16 @@ static HRESULT RegSetSZ(HKEY hRoot, const WCHAR* subKey, const WCHAR* valueName,
             (const BYTE*)data, (DWORD)((wcslen(data) + 1) * sizeof(WCHAR))));
         RegCloseKey(hk);
     }
+    if (hRoot == HKEY_LOCAL_MACHINE)
+        RegDeleteSZUser(subKey, valueName);
     return hr;
+}
+
+static LONG RegDeleteTreeBoth(HKEY hRoot, const WCHAR* subKey)
+{
+    LONG e = RegDeleteTreeW(hRoot, subKey);
+    RegDeleteTreeW(hRoot == HKEY_LOCAL_MACHINE ? HKEY_CURRENT_USER : HKEY_LOCAL_MACHINE, subKey);
+    return e;
 }
 
 static HRESULT GetModulePath(WCHAR* out, DWORD cch)
@@ -339,30 +363,35 @@ STDAPI __declspec(dllexport) DllRegisterServer()
     WCHAR dllPath[MAX_PATH] = { 0 };
     if (FAILED(GetModulePath(dllPath, ARRAYSIZE(dllPath)))) return E_FAIL;
 
-    // Per-user registration: the product installs into the current user's
-    // profile and never asks for elevation, and HKCU\Software\Classes is merged
-    // into HKCR, so the shell finds this exactly like a machine-wide entry.
+    // Machine-wide registration: the installer runs elevated and puts the DLL in
+    // Program Files, so the menu entry is written next to the other shell
+    // extensions and is found no matter which user is logged on.
     //
     // Every step is checked: a registration that silently half-succeeds is the
     // worst outcome, because the menu entry would just never appear.
     WCHAR keyCls[MAX_PATH];
     StringCchPrintfW(keyCls, ARRAYSIZE(keyCls), L"Software\\Classes\\CLSID\\%s", SZ_CM_CLSID);
-    HRESULT hr = RegSetSZ(HKEY_CURRENT_USER, keyCls, nullptr, L"FileRemarks Context Menu");
+    HRESULT hr = RegSetSZ(HKEY_LOCAL_MACHINE, keyCls, nullptr, L"FileRemarks Context Menu");
     if (FAILED(hr)) return hr;
 
     WCHAR keyInproc[MAX_PATH];
     StringCchPrintfW(keyInproc, ARRAYSIZE(keyInproc),
         L"Software\\Classes\\CLSID\\%s\\InprocServer32", SZ_CM_CLSID);
-    hr = RegSetSZ(HKEY_CURRENT_USER, keyInproc, nullptr, dllPath);
+    hr = RegSetSZ(HKEY_LOCAL_MACHINE, keyInproc, nullptr, dllPath);
     if (FAILED(hr)) return hr;
-    hr = RegSetSZ(HKEY_CURRENT_USER, keyInproc, L"ThreadingModel", L"Apartment");
+    hr = RegSetSZ(HKEY_LOCAL_MACHINE, keyInproc, L"ThreadingModel", L"Apartment");
     if (FAILED(hr)) return hr;
 
     WCHAR keyCM[MAX_PATH];
     StringCchPrintfW(keyCM, ARRAYSIZE(keyCM),
         L"Software\\Classes\\*\\shellex\\ContextMenuHandlers\\FileRemarks");
-    hr = RegSetSZ(HKEY_CURRENT_USER, keyCM, nullptr, SZ_CM_CLSID);
+    hr = RegSetSZ(HKEY_LOCAL_MACHINE, keyCM, nullptr, SZ_CM_CLSID);
     if (FAILED(hr)) return hr;
+
+    // Remove the HKCU copies written by v1.9 - v1.15: a stale per-user CLSID
+    // pointing at a deleted DLL is worse than no entry at all.
+    RegDeleteTreeW(HKEY_CURRENT_USER, keyCls);
+    RegDeleteTreeW(HKEY_CURRENT_USER, keyCM);
 
     return S_OK;
 }
@@ -374,12 +403,12 @@ STDAPI __declspec(dllexport) DllUnregisterServer()
     WCHAR keyCM[MAX_PATH];
     StringCchPrintfW(keyCM, ARRAYSIZE(keyCM),
         L"Software\\Classes\\*\\shellex\\ContextMenuHandlers\\FileRemarks");
-    LONG e = RegDeleteTreeW(HKEY_CURRENT_USER, keyCM);
+    LONG e = RegDeleteTreeBoth(HKEY_LOCAL_MACHINE, keyCM);
     if (e != ERROR_SUCCESS && e != ERROR_FILE_NOT_FOUND) hrFirst = HRESULT_FROM_WIN32(e);
 
     WCHAR keyCls[MAX_PATH];
     StringCchPrintfW(keyCls, ARRAYSIZE(keyCls), L"Software\\Classes\\CLSID\\%s", SZ_CM_CLSID);
-    e = RegDeleteTreeW(HKEY_CURRENT_USER, keyCls);
+    e = RegDeleteTreeBoth(HKEY_LOCAL_MACHINE, keyCls);
     if (e != ERROR_SUCCESS && e != ERROR_FILE_NOT_FOUND && SUCCEEDED(hrFirst))
         hrFirst = HRESULT_FROM_WIN32(e);
 

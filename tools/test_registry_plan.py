@@ -146,7 +146,7 @@ def main():
     unpinned = [e for e in pin if not handler_clsid(e)]
     check(True, "%d/%d pin types resolve a CLSID to pin (the rest have no native handler here): %s"
           % (len(pin) - len(unpinned), len(pin), ", ".join(unpinned) or "-"))
-    check("if (!ReadHandlerCLSID(ext, szPin, ARRAYSIZE(szPin))) return;" in src,
+    check("if (!hadKey && !ReadHandlerCLSID(ext, szPin, ARRAYSIZE(szPin))) return;" in src,
           "a pin type without a native handler is skipped instead of pinned to nothing")
     check("PinAllExistingHandlers();" in src,
           "every existing native handler on the machine is pinned, not just the listed ones")
@@ -157,18 +157,32 @@ def main():
           % ("" if not selfpin else ": %s" % selfpin))
     print()
 
-    print("[5] Office documents never end up on our handler")
-    office = {".doc", ".docx", ".docm", ".dotx", ".dotm", ".xls", ".xlsx", ".xlsm",
-              ".xlsb", ".xltx", ".xltm", ".ppt", ".pptx", ".pptm", ".potx", ".potm"}
-    leaked = sorted((office & set(chain)) | (office & set(cand)))
-    check(not leaked, "no Office extension is wrapped or registered directly%s"
-          % ("" if not leaked else ": %s" % leaked))
-    for e in sorted(office):
+    print("[5] Office extensions: OLE wrapped by delegation, OOXML served by our parser")
+    # .doc/.ppt/.xls are the legacy OLE formats: their handler in propsys.dll
+    # answers IPropertyStore, so wrapping them keeps 作者/标题/页数 by delegation
+    # (measured on real files). The OOXML handlers answer E_NOINTERFACE, so there
+    # is nothing to delegate to -- they are taken over and our own docProps reader
+    # reproduces the same columns, because Office's handler cannot open a 0-byte
+    # "新建" file (0x80030050) and the ADS remark would otherwise never show.
+    ole_office = {".doc", ".ppt", ".xls"}
+    ooxml_office = {".docx", ".docm", ".dotx", ".dotm", ".xlsx", ".xlsm",
+                    ".xlsb", ".xltx", ".xltm", ".pptx", ".pptm", ".potx", ".potm"}
+    missing = sorted(ole_office - set(chain))
+    check(not missing, "every OLE Office type is wrapped%s"
+          % ("" if not missing else ": %s" % missing))
+    missing = sorted(ooxml_office - set(chain))
+    check(not missing, "every OOXML Office type is taken over%s"
+          % ("" if not missing else ": %s" % missing))
+    check(not (ooxml_office & set(cand)),
+          "no OOXML Office extension is registered through the candidate path")
+    check(not (ooxml_office & set(pin)),
+          "no OOXML Office extension is left pinned to the Office handler")
+    for e in sorted(ooxml_office | ole_office):
         target = handler_clsid(e)
-        # Pinned (explicit key holds the original CLSID) or left alone.
-        explicit = default_sz("Software\\Classes\\" + e + "\\ShellEx\\PropertyHandler")
-        ok = target is not None and target != OWN_CLSID
-        check(ok, "%-7s resolves to its own handler %s" % (e, target or "(none)"))
+        # Installed builds point these at us; on a clean machine the original
+        # handler must at least still resolve, so uninstall has something to
+        # restore. Either way a handler has to exist.
+        check(target is not None, "%-7s resolves to a handler %s" % (e, target or "(none)"))
     print()
 
     print("[6] user's headline types are covered")

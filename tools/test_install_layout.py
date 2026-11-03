@@ -23,6 +23,7 @@ the fix work: a second install never lands in a directory that already exists.
 """
 import ctypes
 import os
+import re
 import shutil
 import sys
 
@@ -30,7 +31,12 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build")
 WORK = os.path.join(BUILD, "_layout_test")
 DLL = os.path.join(BUILD, "selftest_install.dll")
-VERSION_DIR = "app-1.14"
+# The directory name carries the version, so read it from the source instead of
+# hard-coding it: a version bump used to turn this suite red for no reason.
+_VER = re.search(r'#define FR_VERSION_TEXT\s+L"([^"]+)"',
+                 open(os.path.join(ROOT, 'src', 'version.h'),
+                      encoding='utf-8').read()).group(1)
+VERSION_DIR = 'app-%s' % _VER
 
 FAILS = []
 

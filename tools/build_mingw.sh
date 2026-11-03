@@ -22,10 +22,11 @@ INCS="-I\"$ROOT/src\""
 # Libraries must come AFTER the sources/objects: MinGW's ld discards a library
 # that appears before its first unresolved symbol (this is what made GDI+ look
 # "missing" during early experiments).
-LIBS="-lole32 -lpropsys -lshlwapi -luuid -loleaut32 -ladvapi32 -lshell32 -lcomctl32 -lversion -lkernel32 -lgdi32 -luser32"
+LIBS="-lole32 -lpropsys -lshlwapi -luuid -loleaut32 -ladvapi32 -lshell32 -lcomctl32 -lversion -lkernel32 -lgdi32 -luser32 -lz"
 
 echo "[1/6] Building property handler DLL ..."
 "$GPP" $FLAGS $INCS -shared "$ROOT/src/FileRemarksPropHandler.cpp" \
+    "$ROOT/src/ooxml_meta.cpp" \
     -Wl,--kill-at -o "$OUT/FileRemarksPropHandler.dll" $LIBS
 echo "      -> $OUT/FileRemarksPropHandler.dll"
 
@@ -63,7 +64,10 @@ echo "[6/6] Building test wrappers ..."
     -o "$OUT/selftest_installer_ui.dll" $LIBS
 "$GPP" $FLAGS $INCS -shared "$ROOT/src/selftest_hotkey.cpp" \
     -o "$OUT/selftest_hotkey.dll" $LIBS
-echo "      -> $OUT/selftest_extract.dll, $OUT/selftest_install.dll, $OUT/selftest_native.dll, $OUT/selftest_columns.dll, $OUT/selftest_installer_ui.dll, $OUT/selftest_hotkey.dll"
+# v1.18: the final result-box text and the parent/child marker handshake.
+"$GPP" $FLAGS $INCS -shared "$ROOT/src/selftest_result.cpp" \
+    -o "$OUT/selftest_result.dll" $LIBS
+echo "      -> $OUT/selftest_extract.dll, $OUT/selftest_install.dll, $OUT/selftest_native.dll, $OUT/selftest_columns.dll, $OUT/selftest_installer_ui.dll, $OUT/selftest_hotkey.dll, $OUT/selftest_result.dll"
 
 # Package a ready-to-ship folder: the four binaries.
 # Only the top-level files are replaced; dist/releases/ holds every previously
@@ -85,9 +89,9 @@ python "$ROOT/tools/build_installer.py"
 
 # Name the installer after its own version, so versions never overwrite each
 # other and the file name says what it installs.
-VER="$(sed -n 's/.*#define FR_VERSION_TEXT *L"\([^"]*\)".*/\1/p' "$ROOT/src/selfext.cpp")"
+VER="$(sed -n 's/.*#define FR_VERSION_TEXT *L"\([^"]*\)".*/\1/p' "$ROOT/src/version.h")"
 if [ -z "$VER" ]; then
-    echo "ERROR: could not read FR_VERSION_TEXT from src/selfext.cpp" >&2
+    echo "ERROR: could not read FR_VERSION_TEXT from src/version.h" >&2
     exit 1
 fi
 SETUP="$DIST/releases/FileRemarks_Setup_v${VER}.exe"

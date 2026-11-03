@@ -39,19 +39,21 @@
 
 ---
 
-## 安装（不需要管理员权限）
+## 安装（需要一次管理员授权）
 
-**只有一个文件：`dist/releases/FileRemarks_Setup_v1.14.exe`**
+**只有一个文件：`dist/releases/FileRemarks_Setup_v1.16.exe`**
 
 > `dist/releases/` 里按版本号归档，**每次迭代都保留之前的安装包**，文件名带版本后缀，
 > 所以想回到旧版随时双击对应的那个即可（例如 `FileRemarks_Setup_v1.7.exe`）。
 
-1. 双击它。**不会弹 UAC，也不会有 SmartScreen 的“发行者未知”警告**——见下面的说明。
+1. 双击它。**会弹一次 UAC，点“是”**（未签名程序还可能叠一个 SmartScreen 的“发行者未知”，点“更多信息 → 仍要运行”）。
+   **为什么必须提权一次，见下面的说明**——v1.16 起拒绝 UAC 就**不装**（会说明原因后退出）：
+   只登记到当前用户，exe / jpg / png 这些类型的“备注”列一定是空的，装上去只会让人以为软件坏了。
 2. 弹出安装窗口（Win11 风格，左上角是软件图标）。窗口里先用两栏把版本摆清楚：
 
    | 当前已安装版本 | 要安装的版本 |
    | --- | --- |
-   | 例如 `v1.13`，或 `旧版本（未记录版本号）`，没装过则显示 `未安装` | `v1.14（本安装包）` |
+   | 例如 `v1.14`，或 `旧版本（未记录版本号）`，没装过则显示 `未安装` | `v1.16（本安装包）` |
 
    下面两个按钮：**安装 / 重新安装**（蓝底，回车等同）、**卸载**。没有“取消”按钮——
    不想操作就**直接关窗口或按 `Esc`**。
@@ -61,42 +63,60 @@
 装完在任意文件上右键就有“编辑备注”。卸载用同一个 exe（也在“设置 → 应用”里有
 `FileRemarks` 这一项）。
 
-> ### 为什么以前会弹“Windows 已保护你的电脑 / 发行者未知”
+> ### 为什么需要管理员权限
 >
-> 那不是病毒告警，是 SmartScreen 对**正在申请管理员权限的未签名程序**做的信誉检查。
-> v1.8 及更早的安装器会 `runas` 自提权（往 `C:\Program Files` 装、写 `HKLM`），
-> 而没有商业代码签名证书，于是 Windows 判定“发行者未知”。
+> v1.9–v1.14 的安装器完全不提权，只写 `HKCU`；v1.15 让两边都写；**v1.16 起只写 `HKLM`**。
+> 原因是量出来的：
 >
-> **v1.9 起安装器完全不申请提权**：装到当前用户自己的目录
-> `%LOCALAPPDATA%\FileRemarks`，所有登记项写进 `HKCU`（`HKCU\Software\Classes` 会并入
-> `HKCR`，资源管理器照样认）。没有提权请求 ⇒ 没有 UAC ⇒ **没有这个提示**，
-> 也不需要买证书。
+> 一个类型只要 Windows **本身**已经给它指定了属性处理器（`.exe` → `{66742402-…}`、
+> `.jpg` / `.png` → `{a38b883c-…}` …），资源管理器就**只认机器级（`HKLM`）那一条**，
+> `HKCU` 里指向我们的登记项会被忽略。于是这些类型的“备注”列一直是空的；
+> 而 `txt` / `md` / `py` 因为机器上没有处理器，才会落到我们注册的 `*` 通配项上，
+> 所以它们反而是好的——这就是 v1.13/v1.14 只剩 exe 一类文件不显示的原因。
 >
-> 如果你从网络盘/共享目录直接双击（本机有 `X:` `Y:` `Z:` 三个映射），Windows 仍可能
-> 按“Internet 区域文件”给一个安全警告——那不是本程序的问题，把 exe 复制到本机硬盘再双击即可。
+> 证据：`tools/probe_elevation_needed.py` 对一个 `.png` 取属性存储，`HKCU` 写的是我们的
+> CLSID、`HKLM` 写的是 `{a38b883c-…}`，结果是 `store hr=0x00000000` 且**我们的 DLL
+> 从头到尾都没被加载**（前后 `GetModuleHandleW` 都是 `False`）——资源管理器走的就是机器级那条。
+>
+> 所以 v1.16 安装时提权一次，把登记项写进 `HKLM`，顺带**删掉** v1.9–v1.15 留在 `HKCU` 的那些
+> 登记项（两份登记指向不同的 DLL，正是“备注列变空”的状态）。卸载时两边一起清，
+> 不会留下指向已删除 DLL 的登记项。代价是可能弹一次 UAC，未签名程序还可能被 SmartScreen
+> 提示一次——想彻底消掉只能买代码签名证书（本机没有）。
+>
+> 拒绝 UAC 就**装不了**（v1.16 起安装器直接说明原因并退出）：只登记到当前用户的话，
+> `exe` / `jpg` / `png` 这些类型的备注列一定是空的，装上去只会让人以为软件坏了。
+>
+> 从网络盘/共享目录直接双击（本机有 `X:` `Y:` `Z:` 三个映射）时，Windows 可能按
+> “Internet 区域文件”再给一个警告——把 exe 复制到本机硬盘再双击即可。
 > 安装器是**原生 Unicode 程序**（不是 .bat），中文 Windows 上没有代码页乱码问题；
-> 组件已嵌在 exe 尾部，双击后自己解压、自己注册。出问题时的诊断日志在 `%TEMP%\FileRemarks_log.txt`。
+> 组件已嵌在 exe 尾部，双击后自己解压、自己注册。诊断日志在 `%TEMP%` 下的
+> `FileRemarks_log.txt`。
 
 ### 从 v1.8 及更早版本升级
 
-第一次装 v1.9 时会**同时存在两份**：新的在 `%LOCALAPPDATA%\FileRemarks`（生效），
-旧的 `C:\Program Files\FileRemarks` 只是残留。点“安装”后结束提示里会说明，
-想彻底清掉旧目录需要管理员权限手动删除——留着也不影响使用。
+如果机器上装过 v1.9–v1.15（它们装在 `%LOCALAPPDATA%\FileRemarks` 下、只登记 `HKCU`），
+v1.16 会在安装时**自动拆掉那套**：先反注册旧目录里的两个 DLL、删掉 `HKCU` 的卸载项，
+再把旧目录交给系统重启后删除（被资源管理器占住的 DLL 删不掉，属于正常现象）。
+安装结束的提示里会说明这件事。这样机器上只剩**一份** `HKLM` 登记，
+不会出现“两份登记指向不同 DLL”的那种坏状态——那正是 v1.13–v1.15 备注列为空的原因。
 
-### 覆盖安装时提示“文件正被使用”
+### 覆盖安装
 
-旧版 DLL 通常已经被资源管理器加载，Windows 不允许直接覆盖。安装器会自动：把占用的旧文件
-**改名**成 `*.old`（加载中的 DLL 允许改名）→ 写入新文件 → 旧的 `*.old` 排到下次重启删除。
-所以覆盖安装**不需要先关资源管理器**。
+直接再装一次即可，**不需要先卸载，也不需要重启**。程序装在
+`C:\Program Files\FileRemarks\app-<版本>\`，重复安装会退让成 `app-1.16-2`、
+`app-1.16-3`…，注册项指向新目录，旧目录在下次安装时删掉。
+之所以要换目录：被资源管理器加载中的 DLL 在 Windows 里**既不能覆盖也不能改名**
+（报 `错误码 0x00000005`），只能整目录换掉。
 
 ### 备用：手动安装
 
-1. 把 `dist/` 里的 3 个文件复制到 `%LOCALAPPDATA%\FileRemarks\`：
-   `FileRemarksPropHandler.dll`、`FileRemarksShellExt.dll`、`FileRemarksEditor.exe`
-2. 用**当前用户**的命令提示符执行（不需要管理员）：
+1. 把 `dist/` 里的 4 个文件复制到 `C:\Program Files\FileRemarks\app-<版本>\`：
+   `FileRemarksPropHandler.dll`、`FileRemarksShellExt.dll`、`FileRemarksEditor.exe`、
+   `FileRemarksHotkey.exe`
+2. 用**管理员**命令提示符执行（`HKLM` 需要管理员权限）：
    ```bat
-   regsvr32 "%LOCALAPPDATA%\FileRemarks\FileRemarksPropHandler.dll"
-   regsvr32 "%LOCALAPPDATA%\FileRemarks\FileRemarksShellExt.dll"
+   regsvr32 "C:\Program Files\FileRemarks\app-1.16\FileRemarksPropHandler.dll"
+   regsvr32 "C:\Program Files\FileRemarks\app-1.16\FileRemarksShellExt.dll"
    ```
 3. 重启资源管理器。
 
@@ -115,6 +135,7 @@
    加上父目录的 `SHCNE_UPDATEDIR`），资源管理器收到就重读这一个文件。
    `tools/test_no_delay.py` 就是守这一条的。
 
+> 窗口标题栏上带着当前版本号（例如 `备注  v1.16`），想确认自己跑的是哪个版本，看一眼标题就行。
 > 弹窗里的文件名是只读的，防止改错文件。
 > 窗口内快捷键：`Ctrl+A` 全选、`Ctrl+Backspace` 删一个词、`Esc` 或 `Ctrl+Enter` 直接关窗口
 > （都会自动保存）。
@@ -138,7 +159,7 @@
 
 ## 验证情况
 
-十六个测试脚本 + 六个回归探针全部通过，都是**真实调用编出来的二进制**（真实 NTFS 卷、真实 GUI 窗口、真实 COM 对象、真实注册表读取）：
+十六个测试脚本 + 一组回归探针全部通过，都是**真实调用编出来的二进制**（真实 NTFS 卷、真实 GUI 窗口、真实 COM 对象、真实注册表读取）：
 
 | 测试 | 覆盖什么 | 结果 |
 | --- | --- | --- |
@@ -159,11 +180,11 @@
 | `tools/probe_stale_text.py` | **删掉的字必须真的从屏幕上消失**：9 种删法（退格删掉一整行、全选后删除、先滚动到底再全选删除、从中间删掉一行、选中尾部退格、全选后打一个字覆盖、长文缩成一行、词中间删掉一个字母、滚动后连着退格）三重判据都要过：① 控件里的值必须是剩下的文字；② 画面墨点数要和“新建窗口、只填最终文字”的干净画面一致；③ **强制整块重绘后墨点数不许减少**（少了就说明那些墨点是残留——控件早就忘了，屏幕还留着）。v1.10 之前“从中间删掉一行”残留 `468` 个墨点 vs 干净画面 `108`，整块重绘后掉到 `112`，即 `356` 个像素是假的；现在 9 种全部通过 | **PASS** |
 | `tools/probe_button_flicker.py` | **安装窗口按钮不再闪**：载入真实的 `build/selftest_installer_ui.dll` 起出真窗口，确认父窗口带 `WS_CLIPCHILDREN`；连发 60 条 `WM_MOUSEMOVE` 后父窗口的 `GetUpdateRect` 必须一直为空（修复前每次移动都会让父窗口重绘、把页面底色刷到按钮上）；扫过按钮采样 240 个像素点，丢失 `0` 个；40 次完全相同的移动只触发 `80` 次按钮重绘（进入/离开各一次，且不再随消息数增长） | **PASS** |
 | `tools/test_hotkey.py` | **常驻快捷键进程**：两个产物都在；`PackedCombo()` 必须等于 `0x00040071`（`Shift` + `F2`）；进程起来后窗口类 `FileRemarksHotkeyWnd` 存在（证明组合键真的注册上了）；`%TEMP%\FileRemarks_hotkey.log` 里出现 `helper started`；向运行中的进程发 `WM_QUERY_COMBO` 也回同一个值；第二次启动立即退出且不影响第一个实例；`FrTestLaunchIn` 能起出 `FileRemarksEditorWnd` 窗口；选中的解析在拿不到 shell 视图时返回空串（不瞎猜）；`WM_CLOSE` 后窗口消失、进程退出码 0 | **PASS** |
-| `tools/test_install_layout.py` | **覆盖安装不能碰正在使用的文件**：用 `FR_REMARKS_ROOT` 把安装根指到临时目录（沙箱禁止写 `%LOCALAPPDATA%`），调真 `MakeFreshAppDir()`/`CleanupOldAppDirs()`：第一次装到 `app-1.14`，**第二次必须换到 `app-1.14-2`**、第三次 `app-1.14-3`，且上一次装进去的文件 mtime/大小一个字节都不变；清理只删旧目录、留下刚装的那个；卸载布局把 `app-*` 全删 | **PASS** |
+| `tools/test_install_layout.py` | **覆盖安装不能碰正在使用的文件**：用 `FR_REMARKS_ROOT` 把安装根指到临时目录（沙箱禁止写 `%LOCALAPPDATA%`），调真 `MakeFreshAppDir()`/`CleanupOldAppDirs()`：版本目录名从 `src/version.h` 的 `FR_VERSION_TEXT` 现读（不再写死），第一次装到 `app-1.16`，**第二次必须换到 `app-1.16-2`**、第三次 `app-1.16-3`，且上一次装进去的文件 mtime/大小一个字节都不变；清理只删旧目录、留下刚装的那个；卸载布局把 `app-*` 全删 | **PASS** |
 | `tools/probe_reinstall.py` | **真点“重新安装”**：起真安装包、按真按钮、比对装完的 4 个组件与 `dist/` 的 sha256、打印安装器日志尾部、列 `.old` 残留。本沙箱拒写 `%LOCALAPPDATA%` 会打印 SKIP 并退出 3，要在正常桌面会话里跑才有意义 | **SKIP（沙箱）** |
-| `tools/probe_stream_init.py` | **属性处理器能不能“只给流”地初始化**：不走注册表，直接把 DLL 载入，`DllGetClassObject` → 要 `IInitializeWithStream` → 建一个指向测试文件的流 → `Initialize(stream)` → `QI IPropertyStore` → `GetCount` 必须 ≥ 1。同一个脚本指向 v1.12 的 DLL 会红在“没有这个接口”（正是“备注列一直是空”的根因），指向 v1.13 全过 | **PASS** |
+| `tools/probe_path_init.py` | **属性处理器接受哪种初始化**（v1.16 的关键回归）：直接把 DLL 载入，`DllGetClassObject` → `IInitializeWithStream` **必须被拒绝**（`0x80004002`，只给流时拿不到完整路径，备注一定读不出来）→ `IInitializeWithFile` + `Initialize(完整路径)` → `QI IPropertyStore` → `GetCount ≥ 1` → `GetValue(System.Comment)` **必须等于写入的备注**。指向 v1.15 的 DLL 会红在第一条 | **PASS** |
 | `tools/probe_select_all.py` | **能全选、能一次删光**：起真编辑器、填三行中文，然后按 Ctrl+A —— 修复前 `EM_GETSEL` 拿到的是 `0..0`（一个普通 `EDIT` 控件从来没实现过 Ctrl+A，记事本的“全选”来自它自己的加速键表），所以既选不中也删不掉；现在断言全选范围是 `0..19`、按 Delete 后控件值为空、Ctrl+Backspace 删掉光标前一个词、全选后直接打字会整体替换。同一个脚本指向 Program Files 里那个已安装的旧编辑器时会 4 条全红，正好把“旧版本没这个功能”和“新版本坏了”区分开 | **PASS** |
-| `build/selftest_extract.dll` + `FrSelfTest` | 从最终的 `dist/releases/FileRemarks_Setup_v1.14.exe` 真解压出 **4** 个文件，与 `dist/` 逐个 **sha256 完全一致** | **PASS** |
+| `build/selftest_extract.dll` + `FrSelfTest` | 从最终的 `dist/releases/FileRemarks_Setup_v1.16.exe` 真解压出 **4** 个文件，与 `dist/` 逐个 **sha256 完全一致** | **PASS** |
 
 另外单独验证了旧版 Office 格式的 `System.Comment` 写入：真实 `.doc` / `.xls` / `.ppt` 都能写入、读回、清空；
 `.rtf` 被拒绝（和 `.mp3` 一样属于“少数类型只写 ADS”的情况）。
@@ -179,9 +200,10 @@
 > 另外四种就算提权也写不进去，而安装器当时还照样说“列已打开”。v1.11 因此改成写当前用户自己的
 > 视图副本（见下面更新记录），并从注册表读回来再报告，不再假报成功。
 
-“安装器不再申请提权”这一条则是**真跑出来的**：`tools/probe_no_elevation.py` 直接启动
-`dist/releases/FileRemarks_Setup_v1.12.exe`，读进程令牌确认未提权（`elevated=False`）、
-安装窗口出自同一个未提权进程、全程没有任何 SmartScreen 窗口。
+“资源管理器只认机器级处理器”这一条也是**真跑出来的**：`tools/probe_elevation_needed.py`
+对一个 `.png` 取属性存储，`HKCU` 写我们的 CLSID、`HKLM` 写 `{a38b883c-…}`，结果
+`store hr=0x00000000` 而**我们的 DLL 从未被加载**（前后 `GetModuleHandleW` 都是 `False`）。
+这就是 v1.16 必须提权一次、把登记项写进 `HKLM` 的原因。
 
 ---
 
@@ -253,11 +275,11 @@ python tools/probe_select_all.py           # Ctrl+A 能不能全选、能不能�
 
 > `probe_stale_text.py` 的判据很直接：把“删完之后的样子”和“新建一个窗口、只填最终文字的样子”两张画面比像素数，多出来的墨点就是残留；再加一条更硬的判据——**强制整块重绘一次，墨点数不许变少**，变少就说明那些墨点只是屏幕上的残影。它还可以把目标指向机器上已装的旧版本，用来分辨“是这个 bug 没修”还是“你跑的还是旧版本”：`python tools/probe_stale_text.py "C:\Program Files\FileRemarks\FileRemarksEditor.exe"`。`probe_button_flicker.py` 则直接问父窗口“你现在有要重绘的区域吗”——修复前每收到一条鼠标移动消息就有，修复后一直是空的。
 
-验证“安装器不再申请提权”的探针（v1.9 的核心结论就靠它）：
+验证“为什么必须提权一次”的探针：
 
 ```bash
-python tools/probe_no_elevation.py         # 安装器进程未提权 + 窗口出自该进程 + 无 SmartScreen
-python tools/probe_stream_init.py          # 属性处理器能不能被“只给一个流”地初始化
+python tools/probe_elevation_needed.py     # 资源管理器只认机器级处理器 → 为什么必须提权一次
+python tools/probe_path_init.py            # 属性处理器只接受“完整路径”初始化（v1.16 的回归）
 python tools/probe_hotkey_selection.py     # Shift+F2 取选中文件那一步（本沙箱里必然 SKIP）
 python tools/test_hotkey.py                # 常驻进程：组合键注册、单实例、关窗退出
 python tools/test_install_layout.py        # 覆盖安装为什么不再需要重启（版本目录）
@@ -341,7 +363,7 @@ FileRemarks/
 │   ├── build_msvc.bat              # MSVC 构建脚本
 │   ├── check_logo.py               # 图标形状断言
 │   ├── preview_logo.py             # 把图标画成 PNG 便于肉眼对比
-│   ├── test_*.py                   # 上面那十六个验证脚本 + 六个回归探针
+│   ├── test_*.py                   # 上面那十六个验证脚本 + 回归探针
 │   ├── fake_dataobject.py          # 仅测试用：手搓 IDataObject(CF_HDROP)
 │   ├── test_no_delay.py            # 保存后“备注”列立刻可见
 │   └── mingw64/                    # 便携 MinGW 工具链（仅本地构建用，不入库）
@@ -354,13 +376,58 @@ FileRemarks/
 │       ├── FileRemarks_Setup_v1.11.exe
 │       ├── FileRemarks_Setup_v1.12.exe
 │       ├── FileRemarks_Setup_v1.13.exe
-│       └── FileRemarks_Setup_v1.14.exe
+│       ├── FileRemarks_Setup_v1.14.exe
+│       ├── FileRemarks_Setup_v1.15.exe
+│       └── FileRemarks_Setup_v1.16.exe
 └── build/                          # 编译中间产物
 ```
 
 ---
 
 ## 更新记录
+
+**v1.16**
+
+- **修好“资源管理器备注列一直是空的”**（用户反馈：v1.13 之后列里什么都不显示，编辑窗口里
+  却能看到备注）。三个原因叠在一起，都量过：
+  1. v1.13 给属性处理器加了 `IInitializeWithStream`。资源管理器一旦用“给一个流”的方式驱动
+     处理器，`STATSTG.pwcsName` 里**只有文件名、没有目录**，拿它去读 ADS 备注必然读错位置，
+     于是 `GetValue(System.Comment)` 返回空。证据：`%TEMP%\FileRemarks_propdiag.log` 里
+     一行 `stream init name=Taskmgr.exe relative=yes`。
+  2. v1.15 把登记项也写进 `HKLM` 之后，资源管理器更倾向走这条“只给流 / 隔离宿主”的路，
+     于是**所有**类型都受影响（不再只是 exe）。
+  3. 同时 `HKLM` 指向 `%LOCALAPPDATA%` 里的 DLL，形态本身就不对。
+  修法：**彻底删掉 `IInitializeWithStream`**，只留 `IInitializeWithItem` / `IInitializeWithFile`，
+  逼资源管理器必须把**完整路径**交过来；登记项改成**只写 `HKLM`**、程序装进
+  `C:\Program Files\FileRemarks\app-<版本>\`。
+- 安装器回到 v1.8 的方式：**必须提权一次**，拒绝 UAC 就直接说明原因并退出（不再降级安装）。
+  同时自动清理 v1.9–v1.15 留在 `%LOCALAPPDATA%\FileRemarks` 的整套东西（反注册旧 DLL、
+  删 `HKCU` 卸载项、旧目录交给重启后删除），保证机器上只剩一份登记。
+- **编辑窗口标题栏显示版本号**（用户要求）：标题现在是 `备注  v1.16`。
+- 版本号改成单一来源 `src/version.h`，编辑器、安装器、构建脚本、测试都从它读，
+  以后改版本只动一个文件（`tools/test_install_layout.py` 也不再写死 `app-1.15`）。
+- 新增 `tools/probe_path_init.py`：把“处理器接受哪种初始化”变成可断言的事——
+  `IInitializeWithStream` 必须被拒绝（`0x80004002`），而
+  `IInitializeWithFile` + `Initialize(完整路径)` 之后 `GetValue(System.Comment)`
+  必须**等于写入的备注**。指向 v1.15 的 DLL 会红在第一条。
+  退役 `tools/probe_stream_init.py`（它的结论已经反过来了）。
+- 回归：十六个测试脚本 + 五个回归探针 + logo 检查全部通过；4 个载荷文件 sha256 与 `dist/` 一致。
+
+**v1.15**
+
+- **修好“exe 等类型的备注在资源管理器里不显示”**（用户反馈）。根因不在我们的读取逻辑——
+  同一个文件在编辑窗口里能正常读到备注，只有资源管理器的“备注”列是空的。
+  根因是：一个类型只要 Windows 本身已经给了属性处理器，资源管理器**只认 `HKLM` 那条**，
+  `HKCU` 的登记项被忽略。`.exe` 的机器级处理器是 `{66742402-F9B9-11D1-A202-0000F81FEDEE}`
+  （OLE 结构化存储），它在这种普通 exe 上直接返回 `0x80070715`，列自然是空的。
+  而 `txt`/`md`/`py` 没有机器级处理器，才落到我们的 `*` 通配项上，所以只有 exe 类“看起来坏”。
+  修法：安装时提权一次，登记项同时写 `HKLM` 和 `HKCU`；卸载时两边一起删。
+  拒绝 UAC 仍可安装，只是退回到只有 `txt`/`md`/`py` 可用的模式，安装器会把这一点说清楚。
+- 新增探针 `tools/probe_elevation_needed.py`（直接量出“机器级处理器优先”这条规则 + 检查安装包
+  里确实带了 `runas` / `/elevated` / 拒绝提权时的说明文字），`tools/probe_column_type.py`
+  （问资源管理器自己的 `GetDetailsOf` 那一列显示什么），`tools/probe_store_value.py`
+  （绕过 Shell.Application，直接读属性存储里的 `System.Comment`）。
+- 退役 `tools/probe_no_elevation.py`：它的结论是 v1.9 时代的，现在反而要证明必须提权。
 
 **v1.14**
 
@@ -399,7 +466,7 @@ FileRemarks/
   `IInitializeWithStream`**，要不到就让整个 store 创建失败（`0x80004002`
   `E_NOINTERFACE`），于是资源管理器里“备注”列永远是空的——注册表看起来一切正常，
   也没有任何报错。现在补上了这个接口（把流里的名字还原成路径，下游逻辑不变）。
-  `tools/probe_stream_init.py` 直接加载 DLL 走一遍这条路；同一脚本对 v1.12 的 DLL
+  （该探针 v1.16 起改名为 `tools/probe_path_init.py`，结论也反过来了）直接加载 DLL 走一遍这条路；同一脚本对 v1.12 的 DLL
   会红在“没有 `IInitializeWithStream`”，对 v1.13 通过。
 - **“备注列到底显示了什么”现在可以端到端验证**：`tools/check_install.py` 末尾会造一个带备注的
   文件，然后用 `Shell.Application` 的 `GetDetailsOf` 去读“备注”这一列——这正是资源管理器读列的

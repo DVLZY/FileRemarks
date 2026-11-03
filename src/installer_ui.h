@@ -5,10 +5,14 @@
 // which one is about to be installed. This window replaces them:
 //
 //   * header with the product logo and name,
-//   * one card stating 当前已安装版本 and 要安装的版本 side by side,
+//   * one card with two stacked rows (当前版本 / 目标版本), label left, value
+//     right-aligned on the same baseline, a hairline between them,
 //   * one card explaining what the buttons do,
 //   * owner-drawn rounded buttons (primary / secondary) that still behave like
 //     real buttons for the keyboard, focus and accessibility layers.
+//
+// There is no progress page and there never was one: the installer either shows
+// this window or a result message box.
 //
 // Header-only and painted with plain GDI, so it needs no resource compiler.
 // ---------------------------------------------------------------------------
@@ -45,10 +49,13 @@ struct ChoiceState {
     HFONT fLabel = nullptr;
     HFONT fValue = nullptr;
     HFONT fBody = nullptr;
+    HFONT fBtn = nullptr;
     HBRUSH brPage = nullptr;
     HBRUSH brCard = nullptr;
     HICON icon = nullptr;
+    HICON iconSmall = nullptr;
     int dpi = 96;
+    bool dark = false;
     bool installed = false;
     std::wstring curVersion;
     std::wstring newVersion;
@@ -68,7 +75,7 @@ inline int Sc(const ChoiceState* st, int v) { return MulDiv(v, st->dpi, 96); }
 
 inline RECT CardRect(const ChoiceState* st, int top, int bottom)
 {
-    RECT r = { Sc(st, 24), Sc(st, top), Sc(st, 496), Sc(st, bottom) };
+    RECT r = { Sc(st, 16), Sc(st, top), Sc(st, 504), Sc(st, bottom) };
     return r;
 }
 
@@ -79,9 +86,11 @@ inline const WCHAR* NoteText(const ChoiceState* st)
     return st->installed
         ? L"“重新安装”会用上面的新版覆盖已安装的文件，并重新登记右键菜单和“备注”列。\r\n"
           L"“卸载”会移除本软件及其所有登记项。\r\n"
-          L"安装在当前用户目录下，不需要管理员权限。关掉这个窗口即可退出。"
+          L"安装在 C:\\Program Files\\FileRemarks，需要管理员权限（下一步会提示 UAC）。\r\n"
+          L"关掉这个窗口即取消，不会做任何更改。"
         : L"安装后，在任意文件上点右键即可“编辑备注”，资源管理器里的“备注”列也会默认打开。\r\n"
-          L"安装在当前用户目录下，不需要管理员权限。关掉这个窗口即可退出。";
+          L"安装在 C:\\Program Files\\FileRemarks，需要管理员权限（下一步会提示 UAC）。\r\n"
+          L"关掉这个窗口即取消，不会做任何更改。";
 }
 
 // Creates the type ramp. Called before the window exists so the note text can
@@ -89,11 +98,12 @@ inline const WCHAR* NoteText(const ChoiceState* st)
 inline void CreateFonts(ChoiceState* st)
 {
     if (st->fTitle) return;
-    st->fTitle = theme::Font(Sc(st, 19), FW_SEMIBOLD);
-    st->fSub = theme::Font(Sc(st, 12), FW_NORMAL);
-    st->fLabel = theme::Font(Sc(st, 12), FW_NORMAL);
-    st->fValue = theme::Font(Sc(st, 16), FW_SEMIBOLD);
-    st->fBody = theme::Font(Sc(st, 14), FW_NORMAL);
+    st->fTitle = theme::Font(Sc(st, 15), FW_SEMIBOLD);
+    st->fSub = theme::Font(Sc(st, 11), FW_NORMAL);
+    st->fLabel = theme::Font(Sc(st, 11), FW_NORMAL);
+    st->fValue = theme::Font(Sc(st, 15), FW_SEMIBOLD);
+    st->fBody = theme::Font(Sc(st, 12), FW_NORMAL);
+    st->fBtn = theme::Font(Sc(st, 12), FW_NORMAL);
 }
 
 // Drops and rebuilds the type ramp at the state's current dpi.
@@ -104,7 +114,8 @@ inline void RecreateFonts(ChoiceState* st)
     if (st->fLabel) DeleteObject(st->fLabel);
     if (st->fValue) DeleteObject(st->fValue);
     if (st->fBody) DeleteObject(st->fBody);
-    st->fTitle = st->fSub = st->fLabel = st->fValue = st->fBody = nullptr;
+    if (st->fBtn) DeleteObject(st->fBtn);
+    st->fTitle = st->fSub = st->fLabel = st->fValue = st->fBody = st->fBtn = nullptr;
     CreateFonts(st);
 }
 
@@ -113,8 +124,9 @@ inline void RecreateFonts(ChoiceState* st)
 // creation code agree by construction.
 inline void Layout(ChoiceState* st)
 {
-    // Measure the wrapped note text against the card's inner width.
-    RECT body = { 0, 0, Sc(st, 440), 0 };
+    // Measure the wrapped note text against the card's inner width (16..504
+    // card, 32 padding each side).
+    RECT body = { 0, 0, Sc(st, 456), 0 };
     HDC hdc = GetDC(nullptr);
     if (hdc)
     {
@@ -127,28 +139,27 @@ inline void Layout(ChoiceState* st)
     }
     const int textH = body.bottom - body.top;
     const int padY = Sc(st, 12);
-    const int noteTop = Sc(st, 184);
-    st->noteCard = { Sc(st, 24), noteTop, Sc(st, 496), noteTop + padY * 2 + textH };
-    st->noteBody = { Sc(st, 40), noteTop + padY, Sc(st, 480), noteTop + padY + textH };
+    const int noteTop = Sc(st, 160);
+    st->noteCard = { Sc(st, 16), noteTop, Sc(st, 504), noteTop + padY * 2 + textH };
+    st->noteBody = { Sc(st, 32), noteTop + padY, Sc(st, 488), noteTop + padY + textH };
 
-    // Button row sits below the note card with a comfortable gap.
+    // Button row sits below the note card. The affirmative action is the one on
+    // the right, which is where a Windows installer puts it.
     const int gap = Sc(st, 8);
-    const int btnH = Sc(st, 36);
-    const int btnY = st->noteCard.bottom + Sc(st, 20);
+    const int btnH = Sc(st, 30);
+    const int btnY = st->noteCard.bottom + Sc(st, 24);
 
     st->buttons[0] = { kChoiceInstall, st->installed ? L"重新安装" : L"安装", {}, true };
     st->buttons[1] = { kChoiceUninstall, L"卸载", {}, false };
 
-    int widths[2] = { Sc(st, 108), Sc(st, 84) };
-    int x = Sc(st, 496) - (widths[0] + widths[1] + gap);
-    for (int i = 0; i < st->buttonCount; ++i)
-    {
-        RECT r = { x, btnY, x + widths[i], btnY + btnH };
-        st->buttons[i].rc = r;
-        x += widths[i] + gap;
-    }
+    const int wPrimary = Sc(st, 96);
+    const int wSecondary = Sc(st, 88);
+    int x = Sc(st, 504) - (wPrimary + wSecondary + gap);
+    st->buttons[1].rc = { x, btnY, x + wSecondary, btnY + btnH };
+    x += wSecondary + gap;
+    st->buttons[0].rc = { x, btnY, x + wPrimary, btnY + btnH };
 
-    st->contentBottom = btnY + btnH + Sc(st, 24);
+    st->contentBottom = btnY + btnH + Sc(st, 30);
 }
 
 // Point-in-rect helper used for the owner-drawn button hit test.
@@ -237,26 +248,41 @@ inline LRESULT CALLBACK ButtonProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
 // Draws one button into its OWN device context, which starts at the button's
 // top-left corner -- so the painting rect must be client-local, not the
 // parent-space rect stored in ButtonSpec::rc.
+//
+// States, in the order they matter: disabled (flat, tertiary label), idle,
+// hover (+surface step), pressed (one more step). The primary keeps the accent
+// fill in every enabled state and only darkens it, so it never loses its
+// "this is the action" reading.
 inline void PaintButton(HDC hdc, const ChoiceState* st, const ButtonSpec& b,
-                        const RECT& rc, bool pressed, bool hot)
+                        const RECT& rc, bool pressed, bool hot, bool disabled)
 {
+    const theme::Palette& c = theme::Colors();
     COLORREF fill, text, border;
-    if (b.primary)
+
+    if (disabled)
     {
-        fill = pressed ? theme::kAccentPress : (hot ? theme::kAccentHover : theme::kAccent);
-        text = theme::kAccentText;
+        fill = c.page;
+        text = c.tertiary;
+        border = c.border;
+    }
+    else if (b.primary)
+    {
+        fill = pressed ? c.accentPress : (hot ? c.accentHover : c.accent);
+        text = c.onAccent;
         border = fill;
     }
     else
     {
-        fill = pressed ? RGB(240, 240, 240) : (hot ? RGB(249, 249, 249) : theme::kCard);
-        text = theme::kText;
-        border = theme::kBorder;
+        fill = pressed ? c.pressSurface : (hot ? c.hoverSurface : c.card);
+        text = c.text;
+        border = c.border;
     }
-    theme::RoundedRect(hdc, rc, Sc(st, 6), fill, border, 1);
+
+    theme::RoundedRect(hdc, rc, Sc(st, 4), fill, border, 1);
 
     RECT r = rc;
-    theme::Text(hdc, st->fBody, text, r, b.text, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    theme::Text(hdc, st->fBtn, text, r, b.text,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
 
 inline void Paint(ChoiceState* st, HWND hWnd, HDC hdc)
@@ -266,42 +292,41 @@ inline void Paint(ChoiceState* st, HWND hWnd, HDC hdc)
     FillRect(hdc, &client, st->brPage);
     SetBkMode(hdc, TRANSPARENT);
 
-    // Header: logo + product name + subtitle.
+    const theme::Palette& c = theme::Colors();
+
+    // Header: 20px logo, product name, one line of context.
     if (st->icon)
-        DrawIconEx(hdc, Sc(st, 24), Sc(st, 18), st->icon, Sc(st, 28), Sc(st, 28),
+        DrawIconEx(hdc, Sc(st, 16), Sc(st, 18), st->icon, Sc(st, 20), Sc(st, 20),
                    0, nullptr, DI_NORMAL);
-    RECT title = { Sc(st, 62), Sc(st, 14), Sc(st, 496), Sc(st, 40) };
-    theme::Text(hdc, st->fTitle, theme::kText, title, L"FileRemarks");
-    RECT sub = { Sc(st, 62), Sc(st, 40), Sc(st, 496), Sc(st, 60) };
-    theme::Text(hdc, st->fSub, theme::kMuted, sub, L"安装程序");
+    theme::TextBaseline(hdc, st->fTitle, c.text, Sc(st, 44), Sc(st, 504),
+                        Sc(st, 30), L"FileRemarks");
+    theme::TextBaseline(hdc, st->fSub, c.muted, Sc(st, 44), Sc(st, 504),
+                        Sc(st, 48), L"安装程序");
 
-    // Version card.
-    RECT card = CardRect(st, 72, 172);
-    theme::RoundedRect(hdc, card, Sc(st, 10), theme::kCard, theme::kBorder, 1);
+    // Version card: two rows, label left, value right, one hairline between.
+    // Labels and values share a baseline, which is what makes the two rows read
+    // as a table instead of four drifting boxes.
+    RECT card = CardRect(st, 68, 148);
+    theme::RoundedRect(hdc, card, Sc(st, 8), c.card, c.border, 1);
 
-    RECT l1 = { Sc(st, 40), Sc(st, 86), Sc(st, 260), Sc(st, 104) };
-    theme::Text(hdc, st->fLabel, theme::kMuted, l1, L"当前已安装版本");
-    RECT v1 = { Sc(st, 40), Sc(st, 106), Sc(st, 260), Sc(st, 134) };
-    theme::Text(hdc, st->fValue, st->installed ? theme::kText : theme::kMuted, v1,
-                st->installed ? st->curVersion.c_str() : L"未安装");
+    theme::TextBaseline(hdc, st->fLabel, c.muted, Sc(st, 32), Sc(st, 300),
+                        Sc(st, 96), L"当前版本");
+    theme::TextBaseline(hdc, st->fValue,
+            st->installed ? c.text : c.muted,
+            Sc(st, 300), Sc(st, 488), Sc(st, 96),
+            st->installed ? st->curVersion.c_str() : L"未安装", DT_RIGHT);
 
-    RECT l2 = { Sc(st, 276), Sc(st, 86), Sc(st, 480), Sc(st, 104) };
-    theme::Text(hdc, st->fLabel, theme::kMuted, l2, L"要安装的版本");
-    RECT v2 = { Sc(st, 276), Sc(st, 106), Sc(st, 480), Sc(st, 134) };
-    theme::Text(hdc, st->fValue, theme::kText, v2, st->newVersion.c_str());
+    theme::Hairline(hdc, Sc(st, 32), Sc(st, 488), Sc(st, 116), c.divider);
 
-    // Vertical divider between the two columns.
-    HPEN pen = CreatePen(PS_SOLID, 1, theme::kBorder);
-    HGDIOBJ oldPen = SelectObject(hdc, pen);
-    MoveToEx(hdc, Sc(st, 260), Sc(st, 88), nullptr);
-    LineTo(hdc, Sc(st, 260), Sc(st, 156));
-    SelectObject(hdc, oldPen);
-    DeleteObject(pen);
+    theme::TextBaseline(hdc, st->fLabel, c.muted, Sc(st, 32), Sc(st, 300),
+                        Sc(st, 136), L"目标版本");
+    theme::TextBaseline(hdc, st->fValue, c.accent, Sc(st, 300), Sc(st, 488),
+                        Sc(st, 136), st->newVersion.c_str(), DT_RIGHT);
 
     // Explanation card. Its height was measured from the wrapped text, so the
     // hint is always shown in full -- a fixed height used to clip the last line.
-    theme::RoundedRect(hdc, st->noteCard, Sc(st, 10), theme::kCard, theme::kBorder, 1);
-    theme::Text(hdc, st->fBody, theme::kMuted, st->noteBody, NoteText(st),
+    theme::RoundedRect(hdc, st->noteCard, Sc(st, 8), c.card, c.border, 1);
+    theme::Text(hdc, st->fBody, c.muted, st->noteBody, NoteText(st),
                 DT_LEFT | DT_TOP | DT_WORDBREAK);
 
     // The buttons paint themselves through WM_DRAWITEM (they are child
@@ -320,13 +345,19 @@ inline LRESULT CALLBACK Proc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         st = (ChoiceState*)cs->lpCreateParams;
         SetWindowLongPtrW(hWnd, GWLP_USERDATA, (LONG_PTR)st);
         st->dpi = theme::DpiOf(hWnd);
-        st->brPage = CreateSolidBrush(theme::kPage);
-        st->brCard = CreateSolidBrush(theme::kCard);
+        st->dark = theme::DetectSystemDark();
+        theme::SetDark(st->dark);
+        st->brPage = CreateSolidBrush(theme::Colors().page);
+        st->brCard = CreateSolidBrush(theme::Colors().card);
         // The fonts were created for the screen dpi before the window existed;
         // rebuild them at this window's dpi so the measured layout stays exact.
         RecreateFonts(st);
-        st->icon = logo::CreateLogoIcon(Sc(st, 28));
+        st->icon = logo::CreateLogoIcon(Sc(st, 20));
+        st->iconSmall = logo::CreateLogoIcon(Sc(st, 16));
         theme::RoundWindow(hWnd);
+        theme::ApplyTitleBarTheme(hWnd);
+        if (st->iconSmall)
+            SendMessageW(hWnd, WM_SETICON, ICON_SMALL, (LPARAM)st->iconSmall);
 
         Layout(st);
         for (int i = 0; i < st->buttonCount; ++i)
@@ -341,6 +372,12 @@ inline LRESULT CALLBACK Proc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             // shared, because every button uses the same subclass.
             WNDPROC prev = (WNDPROC)SetWindowLongPtrW(btn, GWLP_WNDPROC, (LONG_PTR)ButtonProc);
             if (prev && !ButtonOldProc()) ButtonOldProc() = prev;
+
+            // Nothing to uninstall when the product is not installed: disabling
+            // the control is louder than the beep the click handler used to
+            // produce, and the keyboard no longer stops on it while tabbing.
+            if (st->buttons[i].id == kChoiceUninstall && !st->installed)
+                EnableWindow(btn, FALSE);
         }
         SetFocus(GetDlgItem(hWnd, st->buttons[0].id));
         return 0;
@@ -390,7 +427,8 @@ inline LRESULT CALLBACK Proc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
                 PaintButton(dis->hDC, st, st->buttons[i], rc,
                             (dis->itemState & ODS_SELECTED) != 0,
-                            ButtonHot(dis->hwndItem));
+                            ButtonHot(dis->hwndItem),
+                            (dis->itemState & ODS_DISABLED) != 0);
                 return TRUE;
             }
         }
@@ -480,7 +518,7 @@ inline int ShowChoice(bool installed, const std::wstring& curVersion,
     // buttons visibly flickered.
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
     HWND hWnd = CreateWindowExW(WS_EX_DLGMODALFRAME, wc.lpszClassName,
-        L"FileRemarks", style,
+        L"FileRemarks 安装程序", style,
         CW_USEDEFAULT, CW_USEDEFAULT, want.right - want.left, want.bottom - want.top,
         nullptr, nullptr, hInst, &st);
     if (!hWnd) return kChoiceCancel;
@@ -500,9 +538,11 @@ inline int ShowChoice(bool installed, const std::wstring& curVersion,
     if (st.fLabel) DeleteObject(st.fLabel);
     if (st.fValue) DeleteObject(st.fValue);
     if (st.fBody) DeleteObject(st.fBody);
+    if (st.fBtn) DeleteObject(st.fBtn);
     if (st.brPage) DeleteObject(st.brPage);
     if (st.brCard) DeleteObject(st.brCard);
     if (st.icon) DestroyIcon(st.icon);
+    if (st.iconSmall) DestroyIcon(st.iconSmall);
     return st.result;
 }
 

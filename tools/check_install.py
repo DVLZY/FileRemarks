@@ -217,7 +217,7 @@ def main():
         print("  the shell's 备注 column reports %r" % (shown or ""))
         print("  -> %s" % ("the column works" if ok else
                            "the column is EMPTY -- the property handler does not "
-                           "reach Explorer (see tools/probe_stream_init.py)"))
+                           "reach Explorer (see tools/probe_path_init.py)"))
     print()
     print("Summary: everything above is registry state plus that one end-to-end "
           "column read.")
@@ -231,11 +231,10 @@ def column_value():
     """Ask the shell what the 备注 column shows for a file that really has a remark.
 
     Registry state can look perfect and the column still be empty -- that is
-    exactly what happened while the handler only accepted a path or a shell item
-    (Windows feeds it a stream when the handler is hosted, and a handler without
-    IInitializeWithStream makes the store fail with E_NOINTERFACE). So the last
-    check is behavioural: write a remark, then read the column the way Explorer
-    reads it, through Shell.Application.
+    exactly what happened in v1.13 - v1.15 (the handler was driven through
+    IInitializeWithStream, which only knows a bare file name, so the remark was
+    read from the wrong path). So the last check is behavioural: write a remark,
+    then read the column the way Explorer reads it, through Shell.Application.
     """
     import subprocess
     import tempfile
@@ -268,7 +267,7 @@ for ($i = 0; $i -lt 400; $i++) {
 if ($idx -lt 0) { [IO.File]::WriteAllText('%s', "NOCOL|", [Text.Encoding]::UTF8); exit }
 $v = $sh.Namespace($root).GetDetailsOf($f, $idx)
 [IO.File]::WriteAllText('%s', "$idx|$v", [Text.Encoding]::UTF8)
-""" % (work, out, out)
+""" % (target, out, out)
     with open(script, "w", encoding="utf-8") as fh:
         fh.write(ps)
     cmd = ('powershell -NoProfile -ExecutionPolicy Bypass -File "%s"' % script)

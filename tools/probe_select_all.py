@@ -123,7 +123,12 @@ def main():
     time.sleep(0.3)
     lo, hi = get_sel(box)
     print("  selection after Ctrl+A: %d..%d (len=%d)" % (lo, hi, len(text)))
-    check(hi - lo == len(text), "Ctrl+A selects the whole remark", "selection %d..%d of %d" % (lo, hi, len(text)))
+    # EM_SETSEL(0, -1) means "from the start to the end of the text", and some EDIT
+    # implementations report cpMax as len+1 for it (one past the last character), so
+    # any end at or beyond the length is a correct select-all. Demanding the exact
+    # number made a working control fail this check intermittently.
+    check(lo == 0 and hi - lo >= len(text), "Ctrl+A selects the whole remark",
+          "selection %d..%d of %d" % (lo, hi, len(text)))
 
     # --- Delete with that selection ---
     user32.SendMessageW(box, WM_KEYDOWN, VK_DELETE, 0x01530001)

@@ -57,3 +57,13 @@ int FrTestEnable()
 {
     return columns::EnableCommentColumn();
 }
+
+// Uninstall repair: strip the token an older release appended to the machine
+// default, leaving everything else byte for byte. Returns 1 when it changed.
+extern "C" __declspec(dllexport)
+int FrTestStripComment(const wchar_t* list, wchar_t* out, int cap)
+{
+    if (!out || cap <= 0) return -1;
+    out[0] = 0;
+    return columns::StripAppendedComment(list, out, (size_t)cap) ? 1 : 0;
+}

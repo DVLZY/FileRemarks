@@ -28,6 +28,13 @@ WM_GETTEXT = 0x000D
 WM_CLOSE = 0x0010
 WM_CHAR = 0x0102
 WM_KEYDOWN = 0x0100
+WM_SETTEXT = 0x000C
+EM_SETSEL = 0x00B1
+EM_GETLINECOUNT = 0x00BA
+EM_GETFIRSTVISIBLELINE = 0x00CE
+EM_SCROLLCARET = 0x00B7
+GWL_STYLE = -16
+WS_VSCROLL = 0x00200000
 VK_BACK = 0x08
 SW_SHOWNORMAL = 1
 
@@ -65,6 +72,8 @@ user32.GetDlgItem.argtypes = [c_void_p, c_int]
 user32.GetDlgItem.restype = c_void_p
 user32.SendMessageW.argtypes = [c_void_p, c_uint32, c_void_p, c_void_p]
 user32.SendMessageW.restype = ctypes.c_ssize_t
+user32.GetWindowLongPtrW.argtypes = [c_void_p, c_int]
+user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
 user32.PostMessageW.argtypes = [c_void_p, c_uint32, c_void_p, c_void_p]
 user32.GetClientRect.argtypes = [c_void_p, ctypes.POINTER(RECT)]
 user32.GetDC.argtypes = [c_void_p]
@@ -272,6 +281,34 @@ def main():
         if back_ink < empty_ink * 0.8:
             failures.append("cue did not come back after the box was emptied with "
                             "Backspace (%d vs %d pixels)" % (back_ink, empty_ink))
+
+        # --- no scrollbar, but the caret still scrolls into view ------------
+        # The vertical scrollbar was removed on request. A multiline EDIT keeps
+        # the caret visible by scrolling its own contents, which is what makes
+        # that acceptable -- prove it here rather than assuming it.
+        print("=== no scrollbar, caret still scrolls ===")
+        style = user32.GetWindowLongPtrW(box, GWL_STYLE)
+        print("  remark box style: 0x%08x" % style)
+        if style & WS_VSCROLL:
+            failures.append("the remark box still asks for a vertical scrollbar")
+
+        many = "\r\n".join("第 %02d 行的备注内容" % i for i in range(1, 41))
+        user32.SendMessageW(box, WM_SETTEXT, None,
+                            ctypes.cast(c_wchar_p(many), c_void_p))
+        user32.SendMessageW(box, EM_SETSEL, c_void_p(0x7FFFFFFF), c_void_p(0x7FFFFFFF))
+        # EM_SETSEL only moves the caret; EM_SCROLLCARET is what brings it
+        # into view, and it is what an insertion does implicitly.
+        user32.SendMessageW(box, EM_SCROLLCARET, None, None)
+        time.sleep(0.3)
+        lines = user32.SendMessageW(box, EM_GETLINECOUNT, None, None)
+        first = user32.SendMessageW(box, EM_GETFIRSTVISIBLELINE, None, None)
+        print("  lines in box: %d   first visible line: %d" % (lines, first))
+        if lines < 40:
+            failures.append("the box did not take the 40-line text (%d lines)"
+                            % lines)
+        if first <= 0:
+            failures.append("the view did not scroll to the caret (first visible "
+                            "line is %d)" % first)
 
         user32.PostMessageW(hwnd, WM_CLOSE, None, None)
         time.sleep(0.6)

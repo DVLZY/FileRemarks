@@ -125,17 +125,44 @@ static inline WCHAR* ReadString(HKEY root, const WCHAR* subKey, const WCHAR* val
 }
 
 // Writes a REG_SZ value, creating the key when needed.
+//
+// HKCU only. An earlier release also mirrored this into HKLM "best effort", and
+// that was wrong on two counts: Music and Videos do grant Administrators
+// FullControl, so the machine-wide default of *every* user on the machine was
+// silently changed, and uninstall had no way back. The per-user override is
+// honoured by Explorer exactly like an HKLM one, so HKLM is left untouched.
 static inline bool WriteString(HKEY root, const WCHAR* subKey, const WCHAR* valueName, const WCHAR* data)
 {
     HKEY hk = nullptr;
     DWORD disp = 0;
+    bool ok = false;
     if (RegCreateKeyExW(root, subKey, 0, nullptr, REG_OPTION_NON_VOLATILE,
-        KEY_WRITE, nullptr, &hk, &disp) != ERROR_SUCCESS)
-        return false;
-    LONG rc = RegSetValueExW(hk, valueName, 0, REG_SZ, (const BYTE*)data,
-        (DWORD)((wcslen(data) + 1) * sizeof(WCHAR)));
-    RegCloseKey(hk);
-    return rc == ERROR_SUCCESS;
+        KEY_WRITE, nullptr, &hk, &disp) == ERROR_SUCCESS)
+    {
+        LONG rc = RegSetValueExW(hk, valueName, 0, REG_SZ, (const BYTE*)data,
+            (DWORD)((wcslen(data) + 1) * sizeof(WCHAR)));
+        RegCloseKey(hk);
+        ok = (rc == ERROR_SUCCESS);
+    }
+    return ok;
+}
+
+// Removes the exact token we append, so uninstall can repair a machine-wide
+// value an older release wrote. Operates on a copy in `out`; returns true when
+// the token was there and `out` holds the repaired list.
+static inline bool StripAppendedComment(const WCHAR* list, WCHAR* out, size_t cch)
+{
+    if (!list || !out || cch == 0) return false;
+    const WCHAR* hit = wcsstr(list, SZ_APPEND);
+    if (!hit) return false;
+
+    StringCchCopyW(out, cch, list);
+    WCHAR* at = out + (hit - list);
+    *at = 0;
+    // Entries are ';'-separated and our token starts with ';', so dropping it is
+    // safe even when it is not the last entry.
+    StringCchCatW(out, cch, hit + (ARRAYSIZE(SZ_APPEND) - 1));
+    return true;
 }
 
 // True when `list` already mentions System.Comment as a column.
@@ -331,6 +358,7 @@ static inline void RemoveFromFolderType(const WCHAR* folderType)
     BackupKey(folderType, keyBackup, ARRAYSIZE(keyBackup));
 
     WCHAR* original = ReadString(HKEY_CURRENT_USER, keyBackup, nullptr);
+    const bool ours = (original != nullptr);
     if (original)
     {
         delete[] original;
@@ -340,6 +368,22 @@ static inline void RemoveFromFolderType(const WCHAR* folderType)
         RegDeleteTreeW(HKEY_CURRENT_USER, keyView);
     }
     RegDeleteKeyW(HKEY_CURRENT_USER, keyBackup);
+
+    // Repair the machine-wide default if a previous release wrote our token into
+    // it. Only Music and Videos are writable there, so all other writes simply
+    // fail and their value is left exactly as Windows shipped it. Gated on the
+    // backup marker so a value somebody else put there by hand is never touched.
+    if (ours)
+    {
+        WCHAR* machine = ReadString(HKEY_LOCAL_MACHINE, keyView, L"ColumnList");
+        if (machine)
+        {
+            WCHAR fixed[1024];
+            if (StripAppendedComment(machine, fixed, ARRAYSIZE(fixed)))
+                WriteString(HKEY_LOCAL_MACHINE, keyView, L"ColumnList", fixed);
+            delete[] machine;
+        }
+    }
 }
 
 // Applies the change to every folder type in the list. Returns the number of

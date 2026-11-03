@@ -21,11 +21,19 @@ Run:  python tools/test_installer_ui.py
 import ctypes
 import ctypes.wintypes as wt
 import os
+import re
 import sys
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build")
+
+# Read the target version from the single source of truth instead of hardcoding
+# it here: this assertion is about "the dialog names the version being
+# installed", not about any particular release.
+with open(os.path.join(ROOT, "src", "version.h"), encoding="utf-8") as _vh:
+    VERSION_TEXT = re.search(r'#define\s+FR_VERSION_TEXT\s+L"([^"]+)"',
+                             _vh.read()).group(1)
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
@@ -96,6 +104,22 @@ def check(cond, msg, detail=""):
     else:
         print("  FAIL  " + msg + (("  [" + detail + "]") if detail else ""))
         FAILS.append(msg)
+
+
+def system_palette():
+    """The installer picks its palette from the Windows app mode, so the
+    expected surfaces follow the machine's setting instead of a fixed file."""
+    import winreg
+    light = 1
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
+            light, _ = winreg.QueryValueEx(k, "AppsUseLightTheme")
+    except OSError:
+        pass
+    if light == 0:
+        return (32, 32, 32), (43, 43, 43)
+    return (243, 243, 243), (255, 255, 255)
 
 
 def text_of(hwnd):
@@ -211,7 +235,8 @@ if installed:
           cur)
 else:
     check(True, "not installed here, so there is no current version to show")
-check(new.startswith("v1.14"), "target version is the 1.14 build", new)
+check(new.startswith("v" + VERSION_TEXT),
+      "target version is the %s build" % VERSION_TEXT, new)
 
 
 # --------------------------------------------------------------------------
@@ -335,9 +360,12 @@ if hwnd:
     print("  card pixel    : %s" % (rgb(card),))
     print("  button pixel  : %s" % (rgb(accent),))
     page_r, page_g, page_b = rgb(page)
-    check(abs(page_r - 243) <= 6 and abs(page_g - 243) <= 6 and abs(page_b - 243) <= 6,
-          "page background is the F3F3F3 surface", str(rgb(page)))
-    check(rgb(card) == (255, 255, 255), "version card is white", str(rgb(card)))
+    exp_page, exp_card = system_palette()
+    check(abs(page_r - exp_page[0]) <= 6 and abs(page_g - exp_page[1]) <= 6 and
+          abs(page_b - exp_page[2]) <= 6,
+          "page background is the app-mode surface", str(rgb(page)))
+    check(rgb(card) == exp_card, "version card is the app-mode card colour",
+          str(rgb(card)))
     acc_r, acc_g, acc_b = rgb(accent)
     check(acc_b > 120 and acc_b > acc_r + 60,
           "primary button fill is accent blue with no white text block",
